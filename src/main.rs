@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::{FromRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -11,12 +11,14 @@ use zray::matcher::Engine;
 use zray::ranker::{DefaultRanker, RankContext};
 use zray::store::{Store, now_ms};
 use zray::theme::{self, THEME_ENV, Theme};
-use zray::tui::{self, Outcome};
+use zray::tui::{self, Outcome, Sources};
 
 const ZSH_INIT: &str = include_str!("../shell/zray.zsh");
 
 /// How many distinct commands a search considers.
 const CANDIDATE_LIMIT: usize = 50_000;
+/// How many directories a search considers.
+const DIRECTORY_LIMIT: usize = 10_000;
 
 #[derive(Parser)]
 #[command(version, about = "Interactive shell history search")]
@@ -43,9 +45,9 @@ enum Command {
         /// Last line of the shell prompt (may contain ANSI escapes).
         #[arg(long, default_value = "> ")]
         prompt: String,
-        /// Viewport height in rows, input line included.
-        #[arg(long, env = "ZRAY_HEIGHT", default_value_t = 10)]
-        height: u16,
+        /// The most candidates to show at once.
+        #[arg(long, env = "ZRAY_MAX_ITEMS", default_value_t = 10)]
+        max_items: u16,
         /// Write the result to this file descriptor instead of stdout, so
         /// stdout can stay attached to the terminal.
         #[arg(long)]
@@ -77,6 +79,8 @@ enum Record {
         host: Option<String>,
         text: String,
     },
+    /// The shell entered this directory.
+    Dir { path: String },
     /// The command with this execution id finished.
     End {
         #[arg(long)]
@@ -94,8 +98,8 @@ enum Shell {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { shell: Shell::Zsh } => init_zsh(),
-        Command::Search { query, cursor, cwd, prompt, height, result_fd } => {
-            search(query, cursor, cwd, prompt, height, result_fd)
+        Command::Search { query, cursor, cwd, prompt, max_items, result_fd } => {
+            search(query, cursor, cwd, prompt, max_items, result_fd)
         }
         Command::Record { action: Record::Start { cwd, session, host, text } } => {
             let id = Store::open_default()?.record_start(
@@ -106,6 +110,9 @@ fn main() -> Result<()> {
             )?;
             println!("{id}");
             Ok(())
+        }
+        Command::Record { action: Record::Dir { path } } => {
+            Store::open_default()?.record_directory(&path)
         }
         Command::Record { action: Record::End { id, exit } } => {
             Store::open_default()?.record_end(id, exit)
@@ -129,25 +136,42 @@ fn search(
     cursor: Option<usize>,
     cwd: Option<String>,
     prompt: String,
-    height: u16,
+    max_items: u16,
     result_fd: Option<RawFd>,
 ) -> Result<()> {
     let cwd = cwd.or_else(|| {
         std::env::current_dir().ok().and_then(|p| p.to_str().map(str::to_string))
     });
-    let rows = Store::open_default()?.load_commands(cwd.as_deref(), CANDIDATE_LIMIT)?;
-    let mut engine =
-        Engine::new(rows, Box::new(DefaultRanker), RankContext { now_ms: now_ms() });
+    let store = Store::open_default()?;
+    let ctx = RankContext { now_ms: now_ms() };
+    let commands = Engine::new(
+        store.load_commands(cwd.as_deref(), CANDIDATE_LIMIT)?,
+        Box::new(DefaultRanker),
+        ctx.clone(),
+    );
+    let directories = Box::new(move || {
+        // Errors cannot be shown while the TUI owns the screen; an empty
+        // tab is the visible symptom.
+        let mut dirs = store.load_directories(DIRECTORY_LIMIT).unwrap_or_default();
+        // Skip where we already are, and directories that are gone. They
+        // stay in the database: the volume may just not be mounted.
+        dirs.retain(|d| Some(&d.text) != cwd.as_ref() && Path::new(&d.text).is_dir());
+        Engine::for_paths(dirs, Box::new(DefaultRanker), ctx)
+    });
     // Problems in the theme are not reported here: anything printed now
     // would land in the middle of the prompt. `zray theme` reports them.
     let (theme, _) = Theme::from_env();
-    let outcome =
-        tui::run(&mut engine, tui::Options { query, cursor, prompt, height, theme })?;
+    let outcome = tui::run(
+        Sources { commands, directories },
+        tui::Options { query, cursor, prompt, max_items, theme },
+    )?;
 
     // First line is the action, the rest is the command text.
     let result = match outcome {
         Outcome::Execute(text) => format!("execute\n{text}\n"),
         Outcome::Edit(text) => format!("edit\n{text}\n"),
+        Outcome::ChangeDirectory(path) => format!("cd\n{path}\n"),
+        Outcome::EditPath(path) => format!("edit-path\n{path}\n"),
         Outcome::Cancel => "cancel\n".to_string(),
     };
     match result_fd {

@@ -26,9 +26,16 @@ _zray_precmd() {
   _zray_exec_id=
 }
 
+_zray_chpwd() {
+  "$_zray_bin" record dir -- "$PWD" </dev/null >/dev/null 2>&1 &!
+}
+
 autoload -Uz add-zsh-hook
 add-zsh-hook preexec _zray_preexec
 add-zsh-hook precmd _zray_precmd
+add-zsh-hook chpwd _zray_chpwd
+# The directory the shell starts in is entered without a chpwd.
+_zray_chpwd
 
 # --- search widget -----------------------------------------------------------
 
@@ -68,6 +75,26 @@ _zray_search() {
       BUFFER=$text
       CURSOR=${#BUFFER}
       zle reset-prompt
+      ;;
+    edit-path)
+      BUFFER=${(q)text}
+      CURSOR=${#BUFFER}
+      zle reset-prompt
+      ;;
+    cd)
+      # Change directory in place: nothing goes through the command line,
+      # so the edit buffer survives and history gains no `cd` entry.
+      if builtin cd -- "$text" 2>/dev/null; then
+        # No command ran, so let prompts that are computed in precmd catch up.
+        local hook
+        for hook in precmd $precmd_functions; do
+          (( $+functions[$hook] )) && $hook
+        done
+        zle reset-prompt
+      else
+        zle reset-prompt
+        zle -M "zray: cannot cd to $text"
+      fi
       ;;
     *)
       zle reset-prompt

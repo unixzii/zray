@@ -3,7 +3,7 @@
 //! This is the extension point for smarter ranking; the search engine only
 //! depends on the [`Ranker`] trait.
 
-use crate::store::CommandRow;
+use crate::item::Item;
 
 /// Facts about the search that are constant across candidates.
 #[derive(Debug, Clone)]
@@ -14,7 +14,7 @@ pub struct RankContext {
 pub trait Ranker {
     /// Higher is better. `fuzzy` is `None` when the query is empty, in which
     /// case every candidate is a match.
-    fn score(&self, row: &CommandRow, fuzzy: Option<u32>, ctx: &RankContext) -> f64;
+    fn score(&self, row: &Item, fuzzy: Option<u32>, ctx: &RankContext) -> f64;
 }
 
 /// Empty query: strictly newest first, so Up + Enter behaves like the stock
@@ -42,7 +42,7 @@ impl DefaultRanker {
 }
 
 impl Ranker for DefaultRanker {
-    fn score(&self, row: &CommandRow, fuzzy: Option<u32>, ctx: &RankContext) -> f64 {
+    fn score(&self, row: &Item, fuzzy: Option<u32>, ctx: &RankContext) -> f64 {
         let Some(fuzzy) = fuzzy else {
             return row.last_used_at as f64;
         };
@@ -63,8 +63,8 @@ impl Ranker for DefaultRanker {
 mod tests {
     use super::*;
 
-    fn row(count: u32, last_used_at: i64, last_exit: Option<i32>, cwd_count: u32) -> CommandRow {
-        CommandRow { id: 0, text: String::new(), count, last_used_at, last_exit, cwd_count }
+    fn row(count: u32, last_used_at: i64, last_exit: Option<i32>, cwd_count: u32) -> Item {
+        Item { text: String::new(), count, last_used_at, last_exit, cwd_count }
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
     fn bonuses_break_ties() {
         let ctx = RankContext { now_ms: 100 * DAY_MS };
         let base = row(1, 0, Some(0), 0);
-        let s = |r: &CommandRow| DefaultRanker.score(r, Some(100), &ctx);
+        let s = |r: &Item| DefaultRanker.score(r, Some(100), &ctx);
         assert!(s(&row(1, 100 * DAY_MS, Some(0), 0)) > s(&base), "recent wins");
         assert!(s(&row(50, 0, Some(0), 0)) > s(&base), "frequent wins");
         assert!(s(&row(1, 0, Some(0), 3)) > s(&base), "same cwd wins");

@@ -4,10 +4,10 @@ use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
 use crate::ranker::{RankContext, Ranker};
-use crate::store::CommandRow;
+use crate::item::Item;
 
 struct Candidate {
-    row: CommandRow,
+    row: Item,
     haystack: Utf32String,
 }
 
@@ -27,12 +27,27 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(rows: Vec<CommandRow>, ranker: Box<dyn Ranker>, ctx: RankContext) -> Self {
+    pub fn new(rows: Vec<Item>, ranker: Box<dyn Ranker>, ctx: RankContext) -> Self {
+        Self::with_config(rows, ranker, ctx, Config::DEFAULT)
+    }
+
+    /// Like [`Engine::new`], but scores matches the way that suits file
+    /// paths: a match right after a `/` counts as the start of a word.
+    pub fn for_paths(rows: Vec<Item>, ranker: Box<dyn Ranker>, ctx: RankContext) -> Self {
+        Self::with_config(rows, ranker, ctx, Config::DEFAULT.match_paths())
+    }
+
+    fn with_config(
+        rows: Vec<Item>,
+        ranker: Box<dyn Ranker>,
+        ctx: RankContext,
+        config: Config,
+    ) -> Self {
         let candidates = rows
             .into_iter()
             .map(|row| Candidate { haystack: Utf32String::from(row.text.as_str()), row })
             .collect();
-        Engine { candidates, matcher: Matcher::new(Config::DEFAULT), ranker, ctx }
+        Engine { candidates, matcher: Matcher::new(config), ranker, ctx }
     }
 
     /// The time the search started; ages are shown relative to it.
@@ -40,7 +55,7 @@ impl Engine {
         self.ctx.now_ms
     }
 
-    pub fn row(&self, index: usize) -> &CommandRow {
+    pub fn row(&self, index: usize) -> &Item {
         &self.candidates[index].row
     }
 
@@ -93,8 +108,7 @@ mod tests {
         let rows = texts
             .iter()
             .enumerate()
-            .map(|(i, t)| CommandRow {
-                id: i as i64,
+            .map(|(i, t)| Item {
                 text: t.to_string(),
                 count: 1,
                 last_used_at: (n - i as i64) * 1000,

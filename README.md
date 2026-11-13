@@ -2,13 +2,15 @@
 
 Interactive history search for zsh. Press <kbd>Up</kbd> at the prompt and the
 prompt grows into a fuzzy finder over your command history; pick a command to
-run it or to pull it into the edit buffer.
+run it or to pull it into the edit buffer. A second tab does the same for the
+directories you have worked in.
 
 ```
   git push origin
   git init
 ▌ git checkout -b new-branch
 ❯ gi
+ commands  directories
 ```
 
 History is kept in its own SQLite database, separate from `$HISTFILE`, along
@@ -51,8 +53,9 @@ until it is on the first line.
 
 | Key | Action |
 | --- | --- |
-| <kbd>Enter</kbd> | Run the selected command |
-| <kbd>Tab</kbd> | Put the selected command in the edit buffer |
+| <kbd>Enter</kbd> | Run the selected command, or change to the selected directory |
+| <kbd>Right</kbd> / <kbd>Ctrl-F</kbd> at the end of the query | Put the selection in the edit buffer |
+| <kbd>Tab</kbd> | Switch between commands and directories |
 | <kbd>Up</kbd> / <kbd>Ctrl-P</kbd> | Move the selection up |
 | <kbd>Down</kbd> / <kbd>Ctrl-N</kbd> | Move the selection down |
 | <kbd>Esc</kbd> | Clear the query; if it is already empty, close |
@@ -65,9 +68,21 @@ newest first, so <kbd>Up</kbd> <kbd>Enter</kbd> reruns the last command. When
 nothing matches, <kbd>Enter</kbd> puts the query text in the edit buffer
 rather than running it.
 
-A query longer than the line wraps, as it would at the zsh prompt. A command
+A query longer than the line wraps, as it would at the zsh prompt. An entry
 too long for its row is cut short with `…`; while it is selected it scrolls
 in a loop instead, so you can read all of it.
+
+### Directories
+
+The directories tab lists the directories you have entered or run commands
+in, most recent first, as absolute paths. It is filtered by the same query as
+the commands tab, and the query stays as you switch. Directories that no
+longer exist and the one you are in are left out.
+
+<kbd>Enter</kbd> changes to the selected directory in place: no `cd` command
+is run, so nothing is added to your history and the edit buffer is untouched.
+<kbd>Right</kbd> puts the path, quoted, in the edit buffer instead. A path too
+long for its row keeps its end rather than its start.
 
 The query uses fzf-style syntax: space-separated terms must all match,
 `'term` matches exactly, `^term` and `term$` anchor, `!term` excludes.
@@ -79,7 +94,7 @@ Set these in `~/.zshrc` before the `eval` line.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `ZRAY_HEIGHT` | `10` | Height of the search area in rows, including the input line. Must be exported. |
+| `ZRAY_MAX_ITEMS` | `10` | The most candidates shown at once. Must be exported. |
 | `ZRAY_PROMPT` | last line of `$PROMPT` | Text shown before the query. |
 | `ZRAY_NO_BIND` | unset | If set, <kbd>Up</kbd> is not bound. Bind the `zray-search` widget yourself. |
 | `ZRAY_DB` | `$XDG_DATA_HOME/zray/history.db`, or `~/.local/share/zray/history.db` | Location of the database. Must be exported. |
@@ -112,6 +127,9 @@ export ZRAY_THEME='match=#ffb454,marker=#59c2ff,selected-bg=#1f2430,muted=244'
 | `marker` | The bar marking the selected row | `cyan` |
 | `muted` | Ages and the `…` of a cut-off command | `bright-black` |
 | `query` | The text you type | `default` |
+| `tab-active` | The name of the tab being shown (always bold) | `black` |
+| `tab-active-bg` | The block behind the name of the tab being shown | `cyan` |
+| `tab` | The names of the other tabs | `bright-black` |
 
 A color is one of:
 
@@ -133,6 +151,8 @@ skips such entries silently.
 Every command you run, from the moment the integration is loaded. Commands
 starting with a space are skipped when `HIST_IGNORE_SPACE` is set. zsh's own
 history is left untouched.
+
+Every directory the shell enters, and the directory each command is run in.
 
 ## Limitations
 

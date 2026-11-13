@@ -1,8 +1,9 @@
 //! Inline-viewport search UI.
 //!
 //! The viewport starts on the row the shell's cursor is on (the last line of
-//! the prompt) and extends downward. The input line sits at the bottom and
-//! candidates stack upward from it, best match nearest the input. On exit the
+//! the prompt) and extends downward. The tab bar is its last row, the input
+//! line sits above that, and candidates stack upward from the input, best
+//! match nearest it. On exit the
 //! viewport is erased and the cursor put back where the shell left it, so the
 //! shell can redraw its prompt in place.
 //!
@@ -37,9 +38,18 @@ pub struct Options {
     pub cursor: Option<usize>,
     /// The last line of the shell prompt, possibly with ANSI escapes.
     pub prompt: String,
-    /// Total viewport height, input line included.
-    pub height: u16,
+    /// The most candidates to show at once. The viewport is this tall plus
+    /// a row each for the input line and the tab bar; a query that wraps
+    /// takes its extra rows from the candidates.
+    pub max_items: u16,
     pub theme: Theme,
+}
+
+/// What can be searched. Commands are needed for the first frame;
+/// directories are loaded only if their tab is opened.
+pub struct Sources {
+    pub commands: Engine,
+    pub directories: Box<dyn FnOnce() -> Engine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +58,10 @@ pub enum Outcome {
     Execute(String),
     /// Put this text in the shell's edit buffer.
     Edit(String),
+    /// Change to this directory.
+    ChangeDirectory(String),
+    /// Put this path in the shell's edit buffer, quoted as one word.
+    EditPath(String),
     /// Leave the shell's buffer as it was.
     Cancel,
 }
@@ -67,37 +81,87 @@ enum Step {
     Done(Outcome),
 }
 
-struct App<'a> {
-    engine: &'a mut Engine,
-    theme: Theme,
-    prompt: Line<'static>,
-    query: String,
-    /// Cursor position in the query, in chars.
-    cursor: usize,
+/// The lists the search box can show, switched with Tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Commands,
+    Directories,
+}
+
+impl Tab {
+    const ALL: [Tab; 2] = [Tab::Commands, Tab::Directories];
+
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Commands => "commands",
+            Tab::Directories => "directories",
+        }
+    }
+
+    fn next(self) -> Tab {
+        match self {
+            Tab::Commands => Tab::Directories,
+            Tab::Directories => Tab::Commands,
+        }
+    }
+}
+
+/// One tab's candidates and where the user is in them.
+struct List {
+    engine: Engine,
     hits: Vec<Hit>,
     /// Index into `hits`; 0 is the best match, drawn nearest the input.
     selected: usize,
     /// Index into `hits` of the row drawn nearest the input.
     offset: usize,
+    /// The query changed while this tab was not showing.
+    stale: bool,
+}
+
+impl List {
+    fn new(engine: Engine) -> Self {
+        List { engine, hits: Vec::new(), selected: 0, offset: 0, stale: true }
+    }
+
+    fn search(&mut self, query: &str) {
+        self.hits = self.engine.search(query);
+        self.selected = 0;
+        self.offset = 0;
+        self.stale = false;
+    }
+}
+
+struct App {
+    commands: List,
+    /// `None` until the tab is first shown.
+    directories: Option<List>,
+    load_directories: Option<Box<dyn FnOnce() -> Engine>>,
+    tab: Tab,
+    theme: Theme,
+    prompt: Line<'static>,
+    /// Shared by all tabs.
+    query: String,
+    /// Cursor position in the query, in chars.
+    cursor: usize,
     /// When the current row became selected; the marquee's clock.
     selected_at: Instant,
     /// Whether the last frame needs redrawing on a timer.
     animating: bool,
 }
 
-impl<'a> App<'a> {
-    fn new(engine: &'a mut Engine, opts: &Options) -> Self {
+impl App {
+    fn new(sources: Sources, opts: &Options) -> Self {
         let query: String = opts.query.lines().next().unwrap_or("").to_string();
         let len = query.chars().count();
         let mut app = App {
-            engine,
+            commands: List::new(sources.commands),
+            directories: None,
+            load_directories: Some(sources.directories),
+            tab: Tab::Commands,
             theme: opts.theme.clone(),
             prompt: parse_prompt(&opts.prompt),
             cursor: opts.cursor.map_or(len, |c| c.min(len)),
             query,
-            hits: Vec::new(),
-            selected: 0,
-            offset: 0,
             selected_at: Instant::now(),
             animating: false,
         };
@@ -105,11 +169,42 @@ impl<'a> App<'a> {
         app
     }
 
+    /// The list of the tab being shown, loading it if this is its first use.
+    fn list(&mut self) -> &mut List {
+        match self.tab {
+            Tab::Commands => &mut self.commands,
+            Tab::Directories => {
+                let load = &mut self.load_directories;
+                self.directories.get_or_insert_with(|| {
+                    let load = load.take().expect("directories are loaded only once");
+                    List::new(load())
+                })
+            }
+        }
+    }
+
+    /// Re-runs the search after the query changed.
     fn refresh(&mut self) {
-        self.hits = self.engine.search(&self.query);
-        self.selected = 0;
-        self.offset = 0;
+        self.commands.stale = true;
+        if let Some(directories) = &mut self.directories {
+            directories.stale = true;
+        }
+        self.show_current();
+    }
+
+    /// Brings the current tab's list up to date with the query.
+    fn show_current(&mut self) {
+        let query = self.query.clone();
+        let list = self.list();
+        if list.stale {
+            list.search(&query);
+        }
         self.selected_at = Instant::now();
+    }
+
+    fn switch_tab(&mut self) {
+        self.tab = self.tab.next();
+        self.show_current();
     }
 
     fn byte_index(&self, char_index: usize) -> usize {
@@ -148,8 +243,41 @@ impl<'a> App<'a> {
         i
     }
 
-    fn selected_text(&self) -> Option<String> {
-        self.hits.get(self.selected).map(|h| self.engine.row(h.index).text.clone())
+    fn selected_text(&mut self) -> Option<String> {
+        let list = self.list();
+        list.hits.get(list.selected).map(|h| list.engine.row(h.index).text.clone())
+    }
+
+    /// Enter: act on the selection the way its tab calls for.
+    fn accept(&mut self) -> Outcome {
+        match (self.selected_text(), self.tab) {
+            (Some(text), Tab::Commands) => Outcome::Execute(text),
+            (Some(path), Tab::Directories) => Outcome::ChangeDirectory(path),
+            // With nothing to pick, hand the typed text back for editing
+            // rather than running something the user never saw matched.
+            (None, _) => Outcome::Edit(self.query.clone()),
+        }
+    }
+
+    /// Right at the end of the query: take the selection into the shell's
+    /// edit buffer. `None` if there is nothing selected.
+    fn take(&mut self) -> Option<Outcome> {
+        let text = self.selected_text()?;
+        Some(match self.tab {
+            Tab::Commands => Outcome::Edit(text),
+            Tab::Directories => Outcome::EditPath(text),
+        })
+    }
+
+    /// Moves the query cursor right, or at the end of the query takes the
+    /// selection, as accepting a suggestion does in a shell.
+    fn right(&mut self, len: usize) -> Step {
+        if self.cursor < len {
+            self.cursor += 1;
+        } else if let Some(outcome) = self.take() {
+            return Step::Done(outcome);
+        }
+        Step::Continue
     }
 
     fn on_key(&mut self, key: KeyEvent) -> Step {
@@ -169,26 +297,17 @@ impl<'a> App<'a> {
                 return Step::Done(Outcome::Cancel);
             }
             KeyCode::Enter | KeyCode::Char('j' | 'm') if ctrl || key.code == KeyCode::Enter => {
-                // With nothing to pick, hand the typed text back for editing
-                // rather than running something the user never saw matched.
-                return Step::Done(match self.selected_text() {
-                    Some(text) => Outcome::Execute(text),
-                    None => Outcome::Edit(self.query.clone()),
-                });
+                return Step::Done(self.accept());
             }
-            KeyCode::Tab => {
-                return Step::Done(Outcome::Edit(
-                    self.selected_text().unwrap_or_else(|| self.query.clone()),
-                ));
-            }
+            KeyCode::Tab | KeyCode::BackTab => self.switch_tab(),
             KeyCode::Up => self.move_selection(1),
             KeyCode::Down => self.move_selection(-1),
             KeyCode::Char('p') if ctrl => self.move_selection(1),
             KeyCode::Char('n') if ctrl => self.move_selection(-1),
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
+            KeyCode::Right => return self.right(len),
             KeyCode::Char('b') if ctrl => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Char('f') if ctrl => self.cursor = (self.cursor + 1).min(len),
+            KeyCode::Char('f') if ctrl => return self.right(len),
             KeyCode::Home => self.cursor = 0,
             KeyCode::End => self.cursor = len,
             KeyCode::Char('a') if ctrl => self.cursor = 0,
@@ -211,13 +330,14 @@ impl<'a> App<'a> {
 
     /// Positive `delta` moves away from the input line, toward worse matches.
     fn move_selection(&mut self, delta: isize) {
-        if self.hits.is_empty() {
+        let list = self.list();
+        if list.hits.is_empty() {
             return;
         }
-        let max = self.hits.len() - 1;
-        let next = self.selected.saturating_add_signed(delta).min(max);
-        if next != self.selected {
-            self.selected = next;
+        let max = list.hits.len() - 1;
+        let next = list.selected.saturating_add_signed(delta).min(max);
+        if next != list.selected {
+            list.selected = next;
             self.selected_at = Instant::now();
         }
     }
@@ -231,31 +351,39 @@ impl<'a> App<'a> {
         let width = usize::from(area.width);
         let prompt_width = self.prompt.width();
 
-        // The query wraps like a shell edit buffer and takes rows from the
-        // list; if it outgrows the viewport, the rows around the cursor win.
+        // Bottom up: the tab bar, the query, then the list. The query wraps
+        // like a shell edit buffer and takes rows from the list; if it
+        // outgrows the viewport, the rows around the cursor win.
+        let tab_rows = usize::from(area.height >= 3);
         let input = layout_input(&self.query, self.cursor, prompt_width, width);
-        let input_rows = input.rows.len().min(usize::from(area.height));
+        let input_rows = input.rows.len().min(usize::from(area.height) - tab_rows);
         let first_input_row = (input.cursor.0 + 1).saturating_sub(input_rows);
-        let input_top = area.bottom() - input_rows as u16;
-        let list_rows = usize::from(area.height) - input_rows;
+        let input_top = area.bottom() - (tab_rows + input_rows) as u16;
+        let list_rows = usize::from(area.height) - tab_rows - input_rows;
+        let indent = if prompt_width == 0 { 2 } else { prompt_width }.min(width / 2).max(1);
+
+        self.list();
+        let list = match self.tab {
+            Tab::Commands => &mut self.commands,
+            Tab::Directories => self.directories.as_mut().expect("loaded by `list`"),
+        };
 
         // Keep the selection inside the visible window.
-        if self.selected < self.offset {
-            self.offset = self.selected;
-        } else if list_rows > 0 && self.selected >= self.offset + list_rows {
-            self.offset = self.selected + 1 - list_rows;
+        if list.selected < list.offset {
+            list.offset = list.selected;
+        } else if list_rows > 0 && list.selected >= list.offset + list_rows {
+            list.offset = list.selected + 1 - list_rows;
         }
 
-        let indent = if prompt_width == 0 { 2 } else { prompt_width }.min(width / 2).max(1);
-        let now = self.engine.now_ms();
+        let now = list.engine.now_ms();
 
         for row in 0..list_rows {
-            let hit_index = self.offset + row;
-            let Some(hit) = self.hits.get(hit_index).copied() else { break };
+            let hit_index = list.offset + row;
+            let Some(hit) = list.hits.get(hit_index).copied() else { break };
             let y = input_top - 1 - row as u16;
-            let selected = hit_index == self.selected;
-            let positions = self.engine.match_positions(&self.query, hit.index);
-            let command = self.engine.row(hit.index);
+            let selected = hit_index == list.selected;
+            let positions = list.engine.match_positions(&self.query, hit.index);
+            let command = list.engine.row(hit.index);
 
             let theme = &self.theme;
             let base = if selected {
@@ -273,12 +401,22 @@ impl<'a> App<'a> {
             let show_age = indent + 2 + age_width < width;
             let avail = if show_age { width - indent - 2 - age_width } else { width - indent };
 
+            // What tells two long paths apart is their end, so a path that
+            // does not fit keeps its tail; a command keeps its head.
+            let keep_tail = self.tab == Tab::Directories;
             let text = if columns.len() <= avail {
                 window(&columns, 0, avail, false)
             } else if selected {
                 self.animating = true;
                 let cycle = columns.len() + MARQUEE_GAP;
-                window(&columns, marquee_offset(self.selected_at.elapsed(), cycle), avail, true)
+                let rest = if keep_tail { columns.len() - avail } else { 0 };
+                let offset = (rest + marquee_offset(self.selected_at.elapsed(), cycle)) % cycle;
+                window(&columns, offset, avail, true)
+            } else if keep_tail {
+                let shown = avail.saturating_sub(1);
+                let mut spans = vec![Span::styled("…", muted)];
+                spans.extend(window(&columns, columns.len() - shown, shown, false));
+                spans
             } else {
                 let mut spans = window(&columns, 0, avail.saturating_sub(1), false);
                 spans.push(Span::styled("…", muted));
@@ -311,6 +449,28 @@ impl<'a> App<'a> {
             line.spans.push(Span::styled(text.clone(), Style::default().fg(self.theme.query)));
             frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
+        if tab_rows > 0 {
+            // Each name is a block padded by a column on either side, the
+            // first flush with the left edge so the active tab's background
+            // leaves no gap there.
+            let mut spans = Vec::new();
+            for tab in Tab::ALL {
+                let style = if tab == self.tab {
+                    Style::default()
+                        .fg(self.theme.tab_active)
+                        .bg(self.theme.tab_active_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(self.theme.tab)
+                };
+                spans.push(Span::styled(format!(" {} ", tab.label()), style));
+            }
+            frame.render_widget(
+                Line::from(spans),
+                Rect::new(area.x, area.bottom() - 1, area.width, 1),
+            );
+        }
+
         let (cursor_row, cursor_col) = input.cursor;
         frame.set_cursor_position((
             area.x + cursor_col.min(width - 1) as u16,
@@ -462,13 +622,13 @@ impl Drop for RawMode {
     }
 }
 
-pub fn run(engine: &mut Engine, opts: Options) -> Result<Outcome> {
+pub fn run(sources: Sources, opts: Options) -> Result<Outcome> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("search needs stdin and stdout to be a terminal");
     }
     let _raw = RawMode::enable()?;
 
-    let mut app = App::new(engine, &opts);
+    let mut app = App::new(sources, &opts);
     let mut out = io::stdout();
 
     // The shell believes its cursor is here; it must be back here on exit.
@@ -485,7 +645,7 @@ pub fn run(engine: &mut Engine, opts: Options) -> Result<Outcome> {
     }
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
-        TerminalOptions { viewport: Viewport::Inline(opts.height.max(2)) },
+        TerminalOptions { viewport: Viewport::Inline(opts.max_items.max(1).saturating_add(2)) },
     )?;
     // The viewport's first row still shows the shell's prompt line, which
     // ratatui's diffing would otherwise assume is blank.

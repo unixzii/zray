@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::item::Item;
+
 /// Session id used for rows imported from a zsh history file.
 const IMPORT_SESSION: &str = "import";
 
@@ -34,20 +36,19 @@ const MIGRATIONS: &[&str] = &[
      CREATE INDEX executions_command ON executions(command_id, started_at);
      CREATE INDEX executions_cwd ON executions(cwd, command_id);
      CREATE INDEX commands_last_used ON commands(last_used_at DESC);",
+    // v2: working directories. Seeded from the directories commands were
+    // run in, counting one visit per shell session seen there.
+    "CREATE TABLE directories (
+         id           INTEGER PRIMARY KEY,
+         path         TEXT NOT NULL UNIQUE,
+         count        INTEGER NOT NULL DEFAULT 0,
+         last_used_at INTEGER NOT NULL DEFAULT 0
+     );
+     CREATE INDEX directories_last_used ON directories(last_used_at DESC);
+     INSERT INTO directories (path, count, last_used_at)
+         SELECT cwd, count(DISTINCT session_id), max(started_at)
+         FROM executions WHERE cwd IS NOT NULL AND cwd != '' GROUP BY cwd;",
 ];
-
-/// A distinct command line plus the stats the ranker works with.
-#[derive(Debug, Clone)]
-pub struct CommandRow {
-    pub id: i64,
-    pub text: String,
-    pub count: u32,
-    /// Milliseconds since the Unix epoch.
-    pub last_used_at: i64,
-    pub last_exit: Option<i32>,
-    /// How many times this command ran in the directory being searched from.
-    pub cwd_count: u32,
-}
 
 pub struct Store {
     conn: Connection,
@@ -149,8 +150,30 @@ impl Store {
             params![command_id, now, cwd, session, hostname],
         )?;
         let id = tx.last_insert_rowid();
+        if let Some(cwd) = cwd {
+            // Working in a directory keeps it recent without counting as
+            // another visit.
+            tx.execute(
+                "INSERT INTO directories (path, count, last_used_at) VALUES (?1, 1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET
+                     last_used_at = max(last_used_at, excluded.last_used_at)",
+                params![cwd, now],
+            )?;
+        }
         tx.commit()?;
         Ok(id)
+    }
+
+    /// Records that the shell entered `path`.
+    pub fn record_directory(&mut self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO directories (path, count, last_used_at) VALUES (?1, 1, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                 count = count + 1,
+                 last_used_at = max(last_used_at, excluded.last_used_at)",
+            params![path, now_ms()],
+        )?;
+        Ok(())
     }
 
     /// Fills in the exit code and duration of an execution.
@@ -217,9 +240,9 @@ impl Store {
     }
 
     /// The `limit` most recently used distinct commands, newest first.
-    pub fn load_commands(&self, cwd: Option<&str>, limit: usize) -> Result<Vec<CommandRow>> {
+    pub fn load_commands(&self, cwd: Option<&str>, limit: usize) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(
-            "SELECT c.id, c.text, c.count, c.last_used_at, c.last_exit, coalesce(d.n, 0)
+            "SELECT c.text, c.count, c.last_used_at, c.last_exit, coalesce(d.n, 0)
              FROM commands c
              LEFT JOIN (
                  SELECT command_id, count(*) AS n FROM executions
@@ -229,13 +252,31 @@ impl Store {
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![cwd, limit as i64], |r| {
-            Ok(CommandRow {
-                id: r.get(0)?,
-                text: r.get(1)?,
-                count: r.get(2)?,
-                last_used_at: r.get(3)?,
-                last_exit: r.get(4)?,
-                cwd_count: r.get(5)?,
+            Ok(Item {
+                text: r.get(0)?,
+                count: r.get(1)?,
+                last_used_at: r.get(2)?,
+                last_exit: r.get(3)?,
+                cwd_count: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The `limit` most recently used directories, newest first.
+    pub fn load_directories(&self, limit: usize) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, count, last_used_at FROM directories
+             ORDER BY last_used_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(Item {
+                text: r.get(0)?,
+                count: r.get(1)?,
+                last_used_at: r.get(2)?,
+                last_exit: None,
+                cwd_count: 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -264,6 +305,45 @@ mod tests {
         assert_eq!(git.cwd_count, 1);
         let ls = rows.iter().find(|r| r.text == "ls").unwrap();
         assert_eq!(ls.last_exit, None);
+    }
+
+    #[test]
+    fn directories_count_visits_and_stay_recent_through_use() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.record_directory("/a").unwrap();
+        s.record_directory("/b").unwrap();
+        s.record_directory("/a").unwrap();
+        // Running commands in /b is not another visit.
+        s.record_start("ls", Some("/b"), None, None).unwrap();
+        s.record_start("ls", Some("/b"), None, None).unwrap();
+        // A directory first seen through a command is listed too.
+        s.record_start("ls", Some("/c"), None, None).unwrap();
+
+        let dirs = s.load_directories(10).unwrap();
+        let count = |p: &str| dirs.iter().find(|d| d.text == p).unwrap().count;
+        assert_eq!((count("/a"), count("/b"), count("/c")), (2, 1, 1));
+        assert_eq!(dirs.len(), 3);
+        assert!(dirs.iter().all(|d| d.last_exit.is_none()));
+    }
+
+    #[test]
+    fn upgrading_seeds_directories_from_past_commands() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO commands (id, text) VALUES (1, 'ls');
+             INSERT INTO executions (command_id, started_at, cwd, session_id) VALUES
+                 (1, 100, '/repo', 's1'), (1, 200, '/repo', 's1'),
+                 (1, 300, '/repo', 's2'), (1, 50, '/tmp', 's1'), (1, 400, NULL, 's1');",
+        )
+        .unwrap();
+
+        let s = Store::init(conn).unwrap();
+        let dirs = s.load_directories(10).unwrap();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!((dirs[0].text.as_str(), dirs[0].count, dirs[0].last_used_at), ("/repo", 2, 300));
+        assert_eq!((dirs[1].text.as_str(), dirs[1].count), ("/tmp", 1));
     }
 
     #[test]

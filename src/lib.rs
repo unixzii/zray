@@ -1,9 +1,9 @@
 //! zray: interactive shell history search.
 //!
-//! `store`, `history`, `matcher` and `ranker` are terminal-independent;
-//! only `tui` touches the tty.
+//! Everything except `tui` is terminal-independent.
 
 pub mod history;
+pub mod item;
 pub mod matcher;
 pub mod ranker;
 pub mod store;

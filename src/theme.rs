@@ -26,6 +26,12 @@ pub struct Theme {
     pub muted: Color,
     /// The text typed into the search box.
     pub query: Color,
+    /// The name of the tab being shown.
+    pub tab_active: Color,
+    /// The block behind the name of the tab being shown.
+    pub tab_active_bg: Color,
+    /// The names of the other tabs.
+    pub tab: Color,
 }
 
 impl Default for Theme {
@@ -40,13 +46,16 @@ impl Default for Theme {
             marker: Color::Cyan,
             muted: Color::DarkGray,
             query: Color::Reset,
+            tab_active: Color::White,
+            tab_active_bg: Color::Black,
+            tab: Color::DarkGray,
         }
     }
 }
 
 impl Theme {
     /// Token names as written in `$ZRAY_THEME`, in display order.
-    pub const TOKENS: [&'static str; 7] = [
+    pub const TOKENS: [&'static str; 10] = [
         "text",
         "selected",
         "selected-bg",
@@ -54,6 +63,9 @@ impl Theme {
         "marker",
         "muted",
         "query",
+        "tab-active",
+        "tab-active-bg",
+        "tab",
     ];
 
     fn slot(&mut self, token: &str) -> Option<&mut Color> {
@@ -65,6 +77,9 @@ impl Theme {
             "marker" => &mut self.marker,
             "muted" => &mut self.muted,
             "query" => &mut self.query,
+            "tab-active" => &mut self.tab_active,
+            "tab-active-bg" => &mut self.tab_active_bg,
+            "tab" => &mut self.tab,
             _ => return None,
         })
     }
