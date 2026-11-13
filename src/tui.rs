@@ -18,7 +18,10 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::{MoveTo, MoveUp, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -152,6 +155,25 @@ impl Transition {
     }
 }
 
+/// Turns on reporting of mouse buttons and the wheel, with coordinates in
+/// the SGR encoding. Motion is deliberately left off: it would flood the
+/// input, and whatever arrived after the search stopped reading would be
+/// typed into the shell.
+const ENABLE_MOUSE: &str = "\x1b[?1000h\x1b[?1006h";
+const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1000l";
+
+/// Where things were drawn in the last frame, for finding what the mouse
+/// is pointing at.
+#[derive(Default, Clone, Copy)]
+struct Geometry {
+    /// Screen row of the candidate nearest the input.
+    first_row_y: u16,
+    /// How many candidates fit.
+    list_rows: usize,
+    /// Screen row of the tab bar, if it is showing.
+    tab_y: Option<u16>,
+}
+
 /// What a key press asks the event loop to do.
 enum Step {
     Continue,
@@ -238,6 +260,7 @@ struct App {
     selected_at: Instant,
     /// Whether the last frame needs redrawing on a timer.
     animating: bool,
+    geometry: Geometry,
 }
 
 impl App {
@@ -259,6 +282,7 @@ impl App {
             colors,
             selected_at: Instant::now(),
             animating: false,
+            geometry: Geometry::default(),
         };
         app.refresh();
         app
@@ -310,6 +334,9 @@ impl App {
         // The clock last ticked whenever the last frame was drawn, which
         // may be long ago.
         self.transition.last_tick = Instant::now();
+        // From here on input is the shell's, and it cannot read mouse reports.
+        let mut out = io::stdout();
+        let _ = out.write_all(DISABLE_MOUSE.as_bytes()).and_then(|()| out.flush());
     }
 
     fn switch_tab(&mut self) {
@@ -397,8 +424,74 @@ impl App {
         Step::Continue
     }
 
+    /// End of the word after the cursor.
+    fn word_end(&self) -> usize {
+        let chars: Vec<char> = self.query.chars().collect();
+        let mut i = self.cursor;
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    fn on_mouse(&mut self, mouse: MouseEvent) {
+        let Geometry { first_row_y, list_rows, tab_y } = self.geometry;
+        match mouse.kind {
+            // The list grows upward, so rolling the wheel up brings later
+            // candidates into view.
+            MouseEventKind::ScrollUp => self.scroll(1),
+            MouseEventKind::ScrollDown => self.scroll(-1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if Some(mouse.row) == tab_y {
+                    let mut x = 0;
+                    for tab in Tab::ALL {
+                        let width = tab.label().len() as u16 + 2;
+                        if (x..x + width).contains(&mouse.column) && tab != self.tab {
+                            self.tab = tab;
+                            self.show_current();
+                        }
+                        x += width;
+                    }
+                } else if mouse.row <= first_row_y
+                    && usize::from(first_row_y - mouse.row) < list_rows
+                {
+                    let list = self.list();
+                    let index = list.offset + usize::from(first_row_y - mouse.row);
+                    if index < list.hits.len() && index != list.selected {
+                        list.selected = index;
+                        self.selected_at = Instant::now();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Scrolls the list by `delta` rows without moving the selection,
+    /// unless it would leave the window; then it rides the edge.
+    fn scroll(&mut self, delta: isize) {
+        let rows = self.geometry.list_rows;
+        let list = self.list();
+        let max_offset = list.hits.len().saturating_sub(rows);
+        let offset = list.offset.saturating_add_signed(delta).min(max_offset);
+        if offset == list.offset || rows == 0 {
+            return;
+        }
+        list.offset = offset;
+        let selected = list.selected.clamp(offset, offset + rows - 1);
+        if selected != list.selected {
+            list.selected = selected;
+            self.selected_at = Instant::now();
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) -> Step {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let page = self.geometry.list_rows.max(1) as isize;
         let len = self.query.chars().count();
         match key.code {
             KeyCode::Esc => {
@@ -423,6 +516,16 @@ impl App {
             KeyCode::Down => self.move_selection(-1),
             KeyCode::Char('p') if ctrl => self.move_selection(1),
             KeyCode::Char('n') if ctrl => self.move_selection(-1),
+            KeyCode::PageUp => self.move_selection(page),
+            KeyCode::PageDown => self.move_selection(-page),
+            // By word. Option+arrow arrives as Alt+arrow or as Esc b / Esc f
+            // depending on the terminal; Ctrl+arrow is the Linux habit.
+            KeyCode::Left if alt || ctrl => self.cursor = self.word_start(),
+            KeyCode::Right if alt || ctrl => self.cursor = self.word_end(),
+            KeyCode::Char('b') if alt => self.cursor = self.word_start(),
+            KeyCode::Char('f') if alt => self.cursor = self.word_end(),
+            KeyCode::Backspace if alt => self.delete_range(self.word_start(), self.cursor),
+            KeyCode::Char('d') if alt => self.delete_range(self.cursor, self.word_end()),
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => return self.right(len),
             KeyCode::Char('b') if ctrl => self.cursor = self.cursor.saturating_sub(1),
@@ -493,6 +596,12 @@ impl App {
         let list = match self.tab {
             Tab::Commands => &mut self.commands,
             Tab::Directories => self.directories.as_mut().expect("loaded by `list`"),
+        };
+
+        self.geometry = Geometry {
+            first_row_y: input_top.saturating_sub(1),
+            list_rows,
+            tab_y: (tab_rows > 0).then(|| area.bottom() - 1),
         };
 
         // Keep the selection inside the visible window.
@@ -876,6 +985,8 @@ impl Drop for RawMode {
         // The cursor is hidden during transitions; an error then must not
         // leave the shell without one.
         let _ = crossterm::execute!(io::stdout(), Show);
+        let _ = io::stdout().write_all(DISABLE_MOUSE.as_bytes());
+        let _ = io::stdout().flush();
         let _ = disable_raw_mode();
     }
 }
@@ -917,6 +1028,8 @@ pub fn run(sources: Sources, opts: Options) -> Result<Outcome> {
     // The viewport's first row still shows the shell's prompt line, which
     // ratatui's diffing would otherwise assume is blank.
     terminal.clear()?;
+    out.write_all(ENABLE_MOUSE.as_bytes())?;
+    out.flush()?;
 
     // Keys that arrived with the terminal's replies come first.
     for key in decode_keys(&probe.typed) {
@@ -951,6 +1064,10 @@ pub fn run(sources: Sources, opts: Options) -> Result<Outcome> {
         }
         let step = match event::read()? {
             Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+            Event::Mouse(mouse) => {
+                app.on_mouse(mouse);
+                Step::Continue
+            }
             Event::Paste(text) => {
                 app.insert(&text);
                 Step::Continue
@@ -1110,6 +1227,151 @@ mod tests {
         t.elapsed = SLIDE;
         assert_eq!(t.alpha(), 1.0);
         assert!(!t.running());
+    }
+
+    fn app(texts: &[&str], query: &str) -> App {
+        use crate::item::Item;
+        use crate::ranker::{DefaultRanker, RankContext};
+        let n = texts.len() as i64;
+        let items = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Item {
+                text: t.to_string(),
+                count: 1,
+                last_used_at: n - i as i64,
+                last_exit: None,
+                cwd_count: 0,
+            })
+            .collect();
+        let ctx = RankContext { now_ms: n };
+        let sources = Sources {
+            commands: Engine::new(items, Box::new(DefaultRanker), ctx.clone()),
+            directories: Box::new(move || {
+                let dir = Item {
+                    text: "/tmp".into(),
+                    count: 1,
+                    last_used_at: 0,
+                    last_exit: None,
+                    cwd_count: 0,
+                };
+                Engine::for_paths(vec![dir], Box::new(DefaultRanker), ctx)
+            }),
+        };
+        let opts = Options {
+            query: query.to_string(),
+            cursor: None,
+            prompt: "> ".to_string(),
+            max_items: 10,
+            theme: Theme::default(),
+        };
+        App::new(sources, &opts, None)
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
+        match app.on_key(KeyEvent::new(code, modifiers)) {
+            Step::Done(outcome) => Some(outcome),
+            Step::Continue => None,
+        }
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    #[test]
+    fn option_arrows_move_by_word_in_either_encoding() {
+        let mut app = app(&[], "git commit  -m msg");
+        let alt = KeyModifiers::ALT;
+        press(&mut app, KeyCode::Left, alt);
+        assert_eq!(app.cursor, 15, "start of `msg`");
+        press(&mut app, KeyCode::Char('b'), alt);
+        assert_eq!(app.cursor, 12, "start of `-m`");
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL);
+        assert_eq!(app.cursor, 4, "start of `commit`, across two spaces");
+        press(&mut app, KeyCode::Right, alt);
+        assert_eq!(app.cursor, 10, "end of `commit`");
+        press(&mut app, KeyCode::Char('f'), alt);
+        assert_eq!(app.cursor, 14, "end of `-m`");
+        // Moving by word at the end of the query does not take the selection.
+        app.cursor = 18;
+        assert_eq!(press(&mut app, KeyCode::Right, alt), None);
+    }
+
+    #[test]
+    fn option_deletes_by_word() {
+        let mut app = app(&[], "git commit -m");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::ALT);
+        assert_eq!(app.query, "git commit ");
+        app.cursor = 4;
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::ALT);
+        assert_eq!(app.query, "git  ");
+        // A plain letter with Option held is not typed.
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::ALT);
+        assert_eq!(app.query, "git  ");
+    }
+
+    #[test]
+    fn esc_returns_to_the_initial_query_then_closes() {
+        let mut app = app(&["echo hello"], "ec");
+        press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(app.query, "ech");
+        assert_eq!(press(&mut app, KeyCode::Esc, KeyModifiers::NONE), None);
+        assert_eq!((app.query.as_str(), app.cursor), ("ec", 2));
+        assert_eq!(press(&mut app, KeyCode::Esc, KeyModifiers::NONE), Some(Outcome::Cancel));
+    }
+
+    #[test]
+    fn wheel_scrolls_the_window_and_carries_the_selection_at_its_edge() {
+        let texts: Vec<String> = (0..20).map(|i| format!("cmd {i}")).collect();
+        let mut app = app(&texts.iter().map(String::as_str).collect::<Vec<_>>(), "");
+        app.geometry = Geometry { first_row_y: 10, list_rows: 5, tab_y: Some(12) };
+
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!((app.commands.offset, app.commands.selected), (1, 1));
+        app.commands.selected = 3;
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!((app.commands.offset, app.commands.selected), (2, 3), "selection stays");
+        for _ in 0..50 {
+            app.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        }
+        assert_eq!((app.commands.offset, app.commands.selected), (15, 15), "stops at the end");
+        for _ in 0..50 {
+            app.on_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        }
+        assert_eq!((app.commands.offset, app.commands.selected), (0, 4));
+    }
+
+    #[test]
+    fn page_keys_move_by_a_screenful() {
+        let texts: Vec<String> = (0..20).map(|i| format!("cmd {i}")).collect();
+        let mut app = app(&texts.iter().map(String::as_str).collect::<Vec<_>>(), "");
+        app.geometry = Geometry { first_row_y: 10, list_rows: 5, tab_y: Some(12) };
+        press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
+        assert_eq!(app.commands.selected, 5);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        assert_eq!(app.commands.selected, 0);
+    }
+
+    #[test]
+    fn clicks_select_rows_and_switch_tabs() {
+        let mut app = app(&["a", "b", "c"], "");
+        app.geometry = Geometry { first_row_y: 10, list_rows: 5, tab_y: Some(12) };
+        let click = |x, y| mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+
+        app.on_mouse(click(7, 8));
+        assert_eq!(app.commands.selected, 2);
+        // A row with no candidate on it.
+        app.on_mouse(click(7, 6));
+        assert_eq!(app.commands.selected, 2);
+        // " commands " is columns 0..10, " directories " follows.
+        app.on_mouse(click(12, 12));
+        assert_eq!(app.tab, Tab::Directories);
+        app.on_mouse(click(12, 12));
+        assert_eq!(app.tab, Tab::Directories, "clicking the current tab does nothing");
+        app.on_mouse(click(0, 12));
+        assert_eq!(app.tab, Tab::Commands);
     }
 
     #[test]

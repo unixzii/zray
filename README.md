@@ -58,10 +58,15 @@ until it is on the first line.
 | <kbd>Tab</kbd> | Switch between commands and directories |
 | <kbd>Up</kbd> / <kbd>Ctrl-P</kbd> | Move the selection up |
 | <kbd>Down</kbd> / <kbd>Ctrl-N</kbd> | Move the selection down |
+| <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Move the selection by a screenful |
+| Mouse wheel | Scroll the list |
+| Click | Select a candidate, or switch to a tab |
 | <kbd>Esc</kbd> | Go back to the query the search opened with; if already there, close |
 | <kbd>Ctrl-C</kbd> / <kbd>Ctrl-G</kbd> | Close |
 | <kbd>Ctrl-W</kbd> / <kbd>Ctrl-U</kbd> / <kbd>Ctrl-K</kbd> | Delete word / to start / to end |
 | <kbd>Ctrl-A</kbd> / <kbd>Ctrl-E</kbd>, arrows | Move the cursor in the query |
+| <kbd>Option-Left</kbd> / <kbd>Option-Right</kbd> | Move the cursor by word (also <kbd>Ctrl</kbd> with the arrows, <kbd>Alt-B</kbd> / <kbd>Alt-F</kbd>) |
+| <kbd>Option-Backspace</kbd> / <kbd>Alt-D</kbd> | Delete the word before / after the cursor |
 
 Closing leaves the edit buffer as it was. With an empty query the list is
 newest first, so <kbd>Up</kbd> <kbd>Enter</kbd> reruns the last command. When
@@ -162,4 +167,7 @@ Every directory the shell enters, and the directory each command is run in.
 
 ## Limitations
 
+- While the search is open it receives mouse clicks and the wheel, so
+  selecting text with the mouse needs your terminal's override (usually
+  holding <kbd>Option</kbd> or <kbd>Shift</kbd>).
 - Right-side prompts and transient prompts are not handled.
