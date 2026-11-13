@@ -33,6 +33,9 @@ enum Command {
         /// Initial contents of the search box.
         #[arg(long, default_value = "")]
         query: String,
+        /// Cursor position in the query, in characters; defaults to the end.
+        #[arg(long)]
+        cursor: Option<usize>,
         /// Directory to rank for; defaults to the current directory.
         #[arg(long)]
         cwd: Option<String>,
@@ -88,8 +91,8 @@ enum Shell {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { shell: Shell::Zsh } => init_zsh(),
-        Command::Search { query, cwd, prompt, height, result_fd } => {
-            search(query, cwd, prompt, height, result_fd)
+        Command::Search { query, cursor, cwd, prompt, height, result_fd } => {
+            search(query, cursor, cwd, prompt, height, result_fd)
         }
         Command::Record { action: Record::Start { cwd, session, host, text } } => {
             let id = Store::open_default()?.record_start(
@@ -119,6 +122,7 @@ fn init_zsh() -> Result<()> {
 
 fn search(
     query: String,
+    cursor: Option<usize>,
     cwd: Option<String>,
     prompt: String,
     height: u16,
@@ -130,7 +134,7 @@ fn search(
     let rows = Store::open_default()?.load_commands(cwd.as_deref(), CANDIDATE_LIMIT)?;
     let mut engine =
         Engine::new(rows, Box::new(DefaultRanker), RankContext { now_ms: now_ms() });
-    let outcome = tui::run(&mut engine, tui::Options { query, prompt, height })?;
+    let outcome = tui::run(&mut engine, tui::Options { query, cursor, prompt, height })?;
 
     // First line is the action, the rest is the command text.
     let result = match outcome {

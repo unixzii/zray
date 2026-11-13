@@ -54,7 +54,7 @@ _zray_search() {
   # fd 3, which is the command substitution's pipe. $TTY is the real device
   # rather than /dev/tty, which macOS cannot poll with kqueue.
   local out
-  out=$("$_zray_bin" search --query "$BUFFER" --cwd "$PWD" --prompt "$prompt_line" \
+  out=$("$_zray_bin" search --query "$BUFFER" --cursor "$CURSOR" --cwd "$PWD" --prompt "$prompt_line" \
     --result-fd 3 3>&1 <$TTY >$TTY)
   local action=${out%%$'\n'*} text=${out#*$'\n'}
 

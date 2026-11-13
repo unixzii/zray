@@ -65,6 +65,10 @@ newest first, so <kbd>Up</kbd> <kbd>Enter</kbd> reruns the last command. When
 nothing matches, <kbd>Enter</kbd> puts the query text in the edit buffer
 rather than running it.
 
+A query longer than the line wraps, as it would at the zsh prompt. A command
+too long for its row is cut short with `…`; while it is selected it scrolls
+in a loop instead, so you can read all of it.
+
 The query uses fzf-style syntax: space-separated terms must all match,
 `'term` matches exactly, `^term` and `term$` anchor, `!term` excludes.
 Matching is case-insensitive unless the query contains an uppercase letter.
@@ -97,4 +101,3 @@ history is left untouched.
 ## Limitations
 
 - Right-side prompts and transient prompts are not handled.
-- A query wider than the terminal is not scrolled horizontally.
