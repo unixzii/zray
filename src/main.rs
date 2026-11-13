@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use zray::matcher::Engine;
 use zray::ranker::{DefaultRanker, RankContext};
 use zray::store::{Store, now_ms};
+use zray::theme::{self, THEME_ENV, Theme};
 use zray::tui::{self, Outcome};
 
 const ZSH_INIT: &str = include_str!("../shell/zray.zsh");
@@ -55,6 +56,8 @@ enum Command {
         #[command(subcommand)]
         action: Record,
     },
+    /// Show the theme in effect and report problems in `$ZRAY_THEME`.
+    Theme,
     /// Import an existing zsh history file.
     Import {
         /// Defaults to `$HISTFILE`, then `~/.zsh_history`.
@@ -107,6 +110,7 @@ fn main() -> Result<()> {
         Command::Record { action: Record::End { id, exit } } => {
             Store::open_default()?.record_end(id, exit)
         }
+        Command::Theme => show_theme(),
         Command::Import { file } => import(file),
     }
 }
@@ -134,7 +138,11 @@ fn search(
     let rows = Store::open_default()?.load_commands(cwd.as_deref(), CANDIDATE_LIMIT)?;
     let mut engine =
         Engine::new(rows, Box::new(DefaultRanker), RankContext { now_ms: now_ms() });
-    let outcome = tui::run(&mut engine, tui::Options { query, cursor, prompt, height })?;
+    // Problems in the theme are not reported here: anything printed now
+    // would land in the middle of the prompt. `zray theme` reports them.
+    let (theme, _) = Theme::from_env();
+    let outcome =
+        tui::run(&mut engine, tui::Options { query, cursor, prompt, height, theme })?;
 
     // First line is the action, the rest is the command text.
     let result = match outcome {
@@ -153,6 +161,28 @@ fn search(
             file.write_all(result.as_bytes()).context("writing result")?;
         }
         None => print!("{result}"),
+    }
+    Ok(())
+}
+
+fn show_theme() -> Result<()> {
+    let (theme, problems) = Theme::from_env();
+    let defaults = Theme::default();
+    for token in Theme::TOKENS {
+        let color = theme.get(token).context("unknown theme token")?;
+        let changed = Some(color) != defaults.get(token);
+        // `selected-bg` is a background; the others are foregrounds.
+        let sgr = theme::sgr(color, token.ends_with("-bg"));
+        let sample = format!("\x1b[{sgr}m  sample  \x1b[0m");
+        let name = theme::color_name(color);
+        println!("{token:<12} {sample} {name}{}", if changed { "  (set)" } else { "" });
+    }
+    if !problems.is_empty() {
+        eprintln!("\nproblems in ${THEME_ENV}:");
+        for p in &problems {
+            eprintln!("  {p}");
+        }
+        std::process::exit(1);
     }
     Ok(())
 }

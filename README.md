@@ -83,6 +83,7 @@ Set these in `~/.zshrc` before the `eval` line.
 | `ZRAY_PROMPT` | last line of `$PROMPT` | Text shown before the query. |
 | `ZRAY_NO_BIND` | unset | If set, <kbd>Up</kbd> is not bound. Bind the `zray-search` widget yourself. |
 | `ZRAY_DB` | `$XDG_DATA_HOME/zray/history.db`, or `~/.local/share/zray/history.db` | Location of the database. Must be exported. |
+| `ZRAY_THEME` | built-in theme | Color overrides, see [Theme](#theme). Must be exported. |
 
 To use a different key:
 
@@ -91,6 +92,41 @@ ZRAY_NO_BIND=1
 eval "$(zray init zsh)"
 bindkey '^R' zray-search
 ```
+
+## Theme
+
+Colors are named by what they are used for. `ZRAY_THEME` is a list of
+`token=color` pairs, separated by commas or spaces, that override the
+built-in theme; tokens you leave out keep their default.
+
+```zsh
+export ZRAY_THEME='match=#ffb454,marker=#59c2ff,selected-bg=#1f2430,muted=244'
+```
+
+| Token | Used for | Default |
+| --- | --- | --- |
+| `text` | Commands in the list | `default` |
+| `selected` | The selected command (always bold) | `default` |
+| `selected-bg` | Background of the selected row | `default` |
+| `match` | Characters the query matched | `yellow` |
+| `marker` | The bar marking the selected row | `cyan` |
+| `muted` | Ages and the `…` of a cut-off command | `bright-black` |
+| `query` | The text you type | `default` |
+
+A color is one of:
+
+- a hex value, `#rrggbb` or `#rgb`
+- an ANSI color name: `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+  `cyan`, `white`, each also as `bright-…`; `gray` is `bright-black`
+- a 256-color index, `0` to `255`
+- `default`, the terminal's own foreground or background
+
+The built-in theme uses only ANSI names, so it follows your terminal's color
+scheme. Hex values need a terminal with 24-bit color.
+
+`zray theme` prints the theme in effect with a sample of each color, and
+reports entries in `ZRAY_THEME` it could not understand. The search itself
+skips such entries silently.
 
 ## What gets recorded
 

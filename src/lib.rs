@@ -7,4 +7,5 @@ pub mod history;
 pub mod matcher;
 pub mod ranker;
 pub mod store;
+pub mod theme;
 pub mod tui;

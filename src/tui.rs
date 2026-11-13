@@ -19,12 +19,13 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
 use crate::matcher::{Engine, Hit};
+use crate::theme::Theme;
 
 pub struct Options {
     /// Initial contents of the search box.
@@ -38,6 +39,7 @@ pub struct Options {
     pub prompt: String,
     /// Total viewport height, input line included.
     pub height: u16,
+    pub theme: Theme,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,7 @@ enum Step {
 
 struct App<'a> {
     engine: &'a mut Engine,
+    theme: Theme,
     prompt: Line<'static>,
     query: String,
     /// Cursor position in the query, in chars.
@@ -88,6 +91,7 @@ impl<'a> App<'a> {
         let len = query.chars().count();
         let mut app = App {
             engine,
+            theme: opts.theme.clone(),
             prompt: parse_prompt(&opts.prompt),
             cursor: opts.cursor.map_or(len, |c| c.min(len)),
             query,
@@ -253,12 +257,14 @@ impl<'a> App<'a> {
             let positions = self.engine.match_positions(&self.query, hit.index);
             let command = self.engine.row(hit.index);
 
+            let theme = &self.theme;
             let base = if selected {
-                Style::default().add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.selected).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(theme.text)
             };
-            let columns = text_columns(&command.text, &positions, base, base.fg(Color::Yellow));
+            let muted = Style::default().fg(theme.muted);
+            let columns = text_columns(&command.text, &positions, base, base.fg(theme.matched));
 
             // The age is pinned to the right edge; the command gets what is
             // left between the indent and it.
@@ -275,29 +281,34 @@ impl<'a> App<'a> {
                 window(&columns, marquee_offset(self.selected_at.elapsed(), cycle), avail, true)
             } else {
                 let mut spans = window(&columns, 0, avail.saturating_sub(1), false);
-                spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled("…", muted));
                 spans
             };
 
             let marker = if selected { "▌" } else { " " };
             let mut spans = vec![
-                Span::styled(marker, Style::default().fg(Color::Cyan)),
+                Span::styled(marker, Style::default().fg(theme.marker)),
                 Span::raw(" ".repeat(indent - 1)),
             ];
             spans.extend(text);
-            frame.render_widget(Line::from(spans), Rect::new(area.x, y, area.width, 1));
+            let row_area = Rect::new(area.x, y, area.width, 1);
+            frame.render_widget(Line::from(spans), row_area);
             if show_age {
                 frame.render_widget(
-                    Span::styled(age, Style::default().fg(Color::DarkGray)),
+                    Span::styled(age, muted),
                     Rect::new(area.right() - age_width as u16, y, age_width as u16, 1),
                 );
+            }
+            if selected {
+                // Covers the whole row, including the blank columns.
+                frame.buffer_mut().set_style(row_area, Style::default().bg(theme.selected_bg));
             }
         }
 
         for (i, text) in input.rows.iter().enumerate().skip(first_input_row).take(input_rows) {
             let y = input_top + (i - first_input_row) as u16;
             let mut line = if i == 0 { self.prompt.clone() } else { Line::default() };
-            line.spans.push(Span::raw(text.clone()));
+            line.spans.push(Span::styled(text.clone(), Style::default().fg(self.theme.query)));
             frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
         let (cursor_row, cursor_col) = input.cursor;
