@@ -153,3 +153,7 @@ Every directory the shell enters, and the directory each command is run in.
   selecting text with the mouse needs your terminal's override (usually
   holding <kbd>Option</kbd> or <kbd>Shift</kbd>).
 - Right-side prompts and transient prompts are not handled.
+
+## License
+
+[MIT](LICENSE)
