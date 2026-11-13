@@ -1,17 +1,10 @@
 # zray
 
-Interactive history search for zsh. Press <kbd>Up</kbd> at the prompt and the
-prompt grows into a fuzzy finder over your command history; pick a command to
-run it or to pull it into the edit buffer. A second tab does the same for the
-directories you have worked in.
+Interactive history search for zsh. You can perform a fuzzy search on your
+command history or directory history, then select an item to execute it or
+insert it into the prompt.
 
-```
-  git push origin
-  git init
-▌ git checkout -b new-branch
-❯ gi
- commands  directories
-```
+![Demo](./demo.gif)
 
 History is kept in its own SQLite database, separate from `$HISTFILE`, along
 with the exit code, duration and working directory of every run. Ranking uses
@@ -33,8 +26,8 @@ Add this to `~/.zshrc`, after anything that sets your prompt (such as
 eval "$(zray init zsh)"
 ```
 
-Plugin managers can load `zray.plugin.zsh` instead; it does the same thing and
-still needs the `zray` binary on `$PATH`.
+Plugin managers can load `zray.plugin.zsh` instead, but it does the same thing
+and still needs the `zray` binary on `$PATH`.
 
 Then import your existing history once:
 
@@ -61,7 +54,7 @@ until it is on the first line.
 | <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Move the selection by a screenful |
 | Mouse wheel | Scroll the list |
 | Click | Select a candidate, or switch to a tab |
-| <kbd>Esc</kbd> | Go back to the query the search opened with; if already there, close |
+| <kbd>Esc</kbd> | Go back to the query the search opened with / close |
 | <kbd>Ctrl-C</kbd> / <kbd>Ctrl-G</kbd> | Close |
 | <kbd>Ctrl-W</kbd> / <kbd>Ctrl-U</kbd> / <kbd>Ctrl-K</kbd> | Delete word / to start / to end |
 | <kbd>Ctrl-A</kbd> / <kbd>Ctrl-E</kbd>, arrows | Move the cursor in the query |
@@ -73,9 +66,9 @@ newest first, so <kbd>Up</kbd> <kbd>Enter</kbd> reruns the last command. When
 nothing matches, <kbd>Enter</kbd> puts the query text in the edit buffer
 rather than running it.
 
-A query longer than the line wraps, as it would at the zsh prompt. An entry
-too long for its row is cut short with `…`; while it is selected it scrolls
-in a loop instead, so you can read all of it.
+The query uses fzf-style syntax: space-separated terms must all match,
+`'term` matches exactly, `^term` and `term$` anchor, `!term` excludes.
+Matching is case-insensitive unless the query contains an uppercase letter.
 
 ### Directories
 
@@ -86,18 +79,7 @@ longer exist and the one you are in are left out.
 
 <kbd>Enter</kbd> changes to the selected directory in place: no `cd` command
 is run, so nothing is added to your history and the edit buffer is untouched.
-<kbd>Right</kbd> puts the path, quoted, in the edit buffer instead. A path too
-long for its row keeps its end rather than its start.
-
-Opening and closing are animated: the prompt line slides to its place and
-the list fades in, about a third of a second in all, and closing plays it
-backwards. The fade needs a terminal with 24-bit color (`COLORTERM` set to
-`truecolor`) that reports its colors; elsewhere the list simply appears once
-the prompt line is in place. Keys pressed during the animation are not lost.
-
-The query uses fzf-style syntax: space-separated terms must all match,
-`'term` matches exactly, `^term` and `term$` anchor, `!term` excludes.
-Matching is case-insensitive unless the query contains an uppercase letter.
+<kbd>Right</kbd> puts the path, quoted, in the edit buffer instead.
 
 ## Configuration
 
@@ -123,7 +105,7 @@ bindkey '^R' zray-search
 
 Colors are named by what they are used for. `ZRAY_THEME` is a list of
 `token=color` pairs, separated by commas or spaces, that override the
-built-in theme; tokens you leave out keep their default.
+built-in theme. Tokens you leave out keep their default.
 
 ```zsh
 export ZRAY_THEME='match=#ffb454,marker=#59c2ff,selected-bg=#1f2430,muted=244'
@@ -146,7 +128,7 @@ A color is one of:
 
 - a hex value, `#rrggbb` or `#rgb`
 - an ANSI color name: `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
-  `cyan`, `white`, each also as `bright-…`; `gray` is `bright-black`
+  `cyan`, `white`, each also as `bright-…` (`gray` is `bright-black`)
 - a 256-color index, `0` to `255`
 - `default`, the terminal's own foreground or background
 
