@@ -50,7 +50,7 @@ until it is on the first line.
 | <kbd>Right</kbd> / <kbd>Ctrl-F</kbd> at the end of the query | Put the selection in the edit buffer |
 | <kbd>Tab</kbd> | Switch between commands and directories |
 | <kbd>Up</kbd> / <kbd>Ctrl-P</kbd> | Move the selection up |
-| <kbd>Down</kbd> / <kbd>Ctrl-N</kbd> | Move the selection down |
+| <kbd>Down</kbd> / <kbd>Ctrl-N</kbd> | Move the selection down. <kbd>Down</kbd> on the bottom row closes, if the query is still the one the search opened with |
 | <kbd>Page Up</kbd> / <kbd>Page Down</kbd> | Move the selection by a screenful |
 | Mouse wheel | Scroll the list |
 | Click | Select a candidate, or switch to a tab |

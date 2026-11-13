@@ -398,7 +398,14 @@ impl App {
             }
             KeyCode::Tab | KeyCode::BackTab => self.switch_tab(),
             KeyCode::Up => self.move_selection(1),
-            KeyCode::Down => self.move_selection(-1),
+            KeyCode::Down => {
+                // Up opens the search, so Down past the row nearest the
+                // input closes it again, unless the query was changed.
+                if self.query == self.initial_query && self.list().selected == 0 {
+                    return Step::Done(Outcome::Cancel);
+                }
+                self.move_selection(-1);
+            }
             KeyCode::Char('p') if ctrl => self.move_selection(1),
             KeyCode::Char('n') if ctrl => self.move_selection(-1),
             KeyCode::PageUp => self.move_selection(page),
@@ -590,6 +597,26 @@ mod tests {
         // A plain letter with Option held is not typed.
         press(&mut app, KeyCode::Char('x'), KeyModifiers::ALT);
         assert_eq!(app.query, "git  ");
+    }
+
+    #[test]
+    fn down_from_the_bottom_row_closes_only_with_the_initial_query() {
+        let mut a = app(&["echo a", "echo b"], "ec");
+        let down = |app: &mut App| press(app, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut a, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(down(&mut a), None, "first back to the bottom row");
+        assert_eq!(a.commands.selected, 0);
+        assert_eq!(down(&mut a), Some(Outcome::Cancel));
+
+        let mut a = app(&["echo a", "echo b"], "ec");
+        press(&mut a, KeyCode::Char('h'), KeyModifiers::NONE);
+        assert_eq!(down(&mut a), None, "the query was changed");
+        // Ctrl-N only moves.
+        let mut a = app(&["echo a"], "");
+        assert_eq!(
+            press(&mut a, KeyCode::Char('n'), KeyModifiers::CONTROL),
+            None
+        );
     }
 
     #[test]
