@@ -90,7 +90,7 @@ is run, so nothing is added to your history and the edit buffer is untouched.
 long for its row keeps its end rather than its start.
 
 Opening and closing are animated: the prompt line slides to its place and
-the list fades in, about a quarter of a second in all, and closing plays it
+the list fades in, about a third of a second in all, and closing plays it
 backwards. The fade needs a terminal with 24-bit color (`COLORTERM` set to
 `truecolor`) that reports its colors; elsewhere the list simply appears once
 the prompt line is in place. Keys pressed during the animation are not lost.

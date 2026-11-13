@@ -7,7 +7,7 @@ use super::Outcome;
 /// Opening: how long the prompt line takes to slide into place.
 pub(super) const SLIDE: Duration = Duration::from_millis(150);
 /// Opening: how long the list and tab bar then take to fade in.
-pub(super) const FADE: Duration = Duration::from_millis(100);
+pub(super) const FADE: Duration = Duration::from_millis(180);
 /// Redraw interval during the opening and closing transitions.
 pub(super) const FRAME: Duration = Duration::from_millis(12);
 
@@ -66,7 +66,9 @@ impl Transition {
         1.0 - (1.0 - t).powi(2)
     }
 
-    /// Opacity of everything but the prompt line.
+    /// Opacity of everything but the prompt line. Linear in time, with no
+    /// easing: an eased fade spends most of its change in a few frames,
+    /// which at this length reads as a jump.
     pub(super) fn alpha(&self) -> f32 {
         match self.elapsed.checked_sub(SLIDE) {
             None => 0.0,
