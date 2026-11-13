@@ -58,7 +58,7 @@ until it is on the first line.
 | <kbd>Tab</kbd> | Switch between commands and directories |
 | <kbd>Up</kbd> / <kbd>Ctrl-P</kbd> | Move the selection up |
 | <kbd>Down</kbd> / <kbd>Ctrl-N</kbd> | Move the selection down |
-| <kbd>Esc</kbd> | Clear the query; if it is already empty, close |
+| <kbd>Esc</kbd> | Go back to the query the search opened with; if already there, close |
 | <kbd>Ctrl-C</kbd> / <kbd>Ctrl-G</kbd> | Close |
 | <kbd>Ctrl-W</kbd> / <kbd>Ctrl-U</kbd> / <kbd>Ctrl-K</kbd> | Delete word / to start / to end |
 | <kbd>Ctrl-A</kbd> / <kbd>Ctrl-E</kbd>, arrows | Move the cursor in the query |
@@ -83,6 +83,12 @@ longer exist and the one you are in are left out.
 is run, so nothing is added to your history and the edit buffer is untouched.
 <kbd>Right</kbd> puts the path, quoted, in the edit buffer instead. A path too
 long for its row keeps its end rather than its start.
+
+Opening and closing are animated: the prompt line slides to its place and
+the list fades in, about a quarter of a second in all, and closing plays it
+backwards. The fade needs a terminal with 24-bit color (`COLORTERM` set to
+`truecolor`) that reports its colors; elsewhere the list simply appears once
+the prompt line is in place. Keys pressed during the animation are not lost.
 
 The query uses fzf-style syntax: space-separated terms must all match,
 `'term` matches exactly, `^term` and `term$` anchor, `!term` excludes.
@@ -127,8 +133,8 @@ export ZRAY_THEME='match=#ffb454,marker=#59c2ff,selected-bg=#1f2430,muted=244'
 | `marker` | The bar marking the selected row | `cyan` |
 | `muted` | Ages and the `…` of a cut-off command | `bright-black` |
 | `query` | The text you type | `default` |
-| `tab-active` | The name of the tab being shown (always bold) | `black` |
-| `tab-active-bg` | The block behind the name of the tab being shown | `cyan` |
+| `tab-active` | The name of the tab being shown (always bold) | `bright-white` |
+| `tab-active-bg` | The block behind the name of the tab being shown | `black` |
 | `tab` | The names of the other tabs | `bright-black` |
 
 A color is one of:

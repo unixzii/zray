@@ -1109,6 +1109,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "libc",
  "nucleo-matcher",
  "ratatui",
  "rusqlite",

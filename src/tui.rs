@@ -3,7 +3,9 @@
 //! The viewport starts on the row the shell's cursor is on (the last line of
 //! the prompt) and extends downward. The tab bar is its last row, the input
 //! line sits above that, and candidates stack upward from the input, best
-//! match nearest it. On exit the
+//! match nearest it. Opening is animated: the prompt line slides down from
+//! where the shell drew it to its place, then the rest fades in; closing
+//! plays that backwards. On exit the
 //! viewport is erased and the cursor put back where the shell left it, so the
 //! shell can redraw its prompt in place.
 //!
@@ -17,15 +19,18 @@ use ansi_to_tui::IntoText;
 use anyhow::{Context, Result, bail};
 use crossterm::cursor::{MoveTo, MoveUp, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthChar;
 
 use crate::matcher::{Engine, Hit};
+use crate::term::{self, TermColors};
 use crate::theme::Theme;
 
 pub struct Options {
@@ -75,6 +80,78 @@ const MARQUEE_GAP: usize = 4;
 /// Redraw interval while something is animating.
 const TICK: Duration = Duration::from_millis(40);
 
+/// Opening: how long the prompt line takes to slide into place.
+const SLIDE: Duration = Duration::from_millis(150);
+/// Opening: how long the list and tab bar then take to fade in.
+const FADE: Duration = Duration::from_millis(100);
+/// Redraw interval during the opening and closing transitions.
+const FRAME: Duration = Duration::from_millis(12);
+
+/// Where the opening transition stands. Closing runs it backwards from
+/// wherever it is, so closing right after opening costs no more time than
+/// the opening got to take.
+struct Transition {
+    /// Time into the opening: the slide first, then the fade.
+    elapsed: Duration,
+    last_tick: Instant,
+    /// Set once the user is done: what to report when the closing ends.
+    outcome: Option<Outcome>,
+    /// Without the terminal's colors there is nothing to mix, so the fade
+    /// is skipped and the list appears as the slide ends.
+    fade: Duration,
+}
+
+impl Transition {
+    fn new(can_fade: bool) -> Self {
+        Transition {
+            elapsed: Duration::ZERO,
+            last_tick: Instant::now(),
+            outcome: None,
+            fade: if can_fade { FADE } else { Duration::ZERO },
+        }
+    }
+
+    fn advance(&mut self) {
+        let now = Instant::now();
+        let step = now - self.last_tick;
+        self.last_tick = now;
+        self.elapsed = if self.outcome.is_some() {
+            self.elapsed.saturating_sub(step)
+        } else {
+            (self.elapsed + step).min(SLIDE + self.fade)
+        };
+    }
+
+    fn closing(&self) -> bool {
+        self.outcome.is_some()
+    }
+
+    /// Still moving, in either direction.
+    fn running(&self) -> bool {
+        self.closing() || self.elapsed < SLIDE + self.fade
+    }
+
+    fn closed(&self) -> bool {
+        self.closing() && self.elapsed.is_zero()
+    }
+
+    /// 0 with the prompt line where the shell drew it, 1 with it in place.
+    /// Eased so it decelerates into place.
+    fn slide(&self) -> f32 {
+        let t = (self.elapsed.as_secs_f32() / SLIDE.as_secs_f32()).min(1.0);
+        1.0 - (1.0 - t).powi(2)
+    }
+
+    /// Opacity of everything but the prompt line.
+    fn alpha(&self) -> f32 {
+        match self.elapsed.checked_sub(SLIDE) {
+            None => 0.0,
+            Some(_) if self.fade.is_zero() => 1.0,
+            Some(into_fade) => (into_fade.as_secs_f32() / self.fade.as_secs_f32()).min(1.0),
+        }
+    }
+}
+
 /// What a key press asks the event loop to do.
 enum Step {
     Continue,
@@ -120,7 +197,13 @@ struct List {
 
 impl List {
     fn new(engine: Engine) -> Self {
-        List { engine, hits: Vec::new(), selected: 0, offset: 0, stale: true }
+        List {
+            engine,
+            hits: Vec::new(),
+            selected: 0,
+            offset: 0,
+            stale: true,
+        }
     }
 
     fn search(&mut self, query: &str) {
@@ -141,6 +224,14 @@ struct App {
     prompt: Line<'static>,
     /// Shared by all tabs.
     query: String,
+    /// The query the search was opened with; Esc returns to it.
+    initial_query: String,
+    /// While closing, what the shell's buffer is about to hold. Shown in
+    /// place of the query so the line does not change as the shell takes over.
+    closing_text: Option<String>,
+    transition: Transition,
+    /// The terminal's colors, if it reported them; needed for fading.
+    colors: Option<TermColors>,
     /// Cursor position in the query, in chars.
     cursor: usize,
     /// When the current row became selected; the marquee's clock.
@@ -150,7 +241,7 @@ struct App {
 }
 
 impl App {
-    fn new(sources: Sources, opts: &Options) -> Self {
+    fn new(sources: Sources, opts: &Options, colors: Option<TermColors>) -> Self {
         let query: String = opts.query.lines().next().unwrap_or("").to_string();
         let len = query.chars().count();
         let mut app = App {
@@ -161,7 +252,11 @@ impl App {
             theme: opts.theme.clone(),
             prompt: parse_prompt(&opts.prompt),
             cursor: opts.cursor.map_or(len, |c| c.min(len)),
+            initial_query: query.clone(),
             query,
+            closing_text: None,
+            transition: Transition::new(colors.is_some()),
+            colors,
             selected_at: Instant::now(),
             animating: false,
         };
@@ -202,19 +297,39 @@ impl App {
         self.selected_at = Instant::now();
     }
 
+    /// Starts the closing transition; `outcome` is reported when it ends.
+    fn close(&mut self, outcome: Outcome) {
+        self.closing_text = Some(match &outcome {
+            Outcome::Execute(text) | Outcome::Edit(text) | Outcome::EditPath(text) => {
+                text.replace('\n', " ")
+            }
+            // These leave the shell's buffer as it was.
+            Outcome::ChangeDirectory(_) | Outcome::Cancel => self.initial_query.clone(),
+        });
+        self.transition.outcome = Some(outcome);
+        // The clock last ticked whenever the last frame was drawn, which
+        // may be long ago.
+        self.transition.last_tick = Instant::now();
+    }
+
     fn switch_tab(&mut self) {
         self.tab = self.tab.next();
         self.show_current();
     }
 
     fn byte_index(&self, char_index: usize) -> usize {
-        self.query.char_indices().nth(char_index).map_or(self.query.len(), |(i, _)| i)
+        self.query
+            .char_indices()
+            .nth(char_index)
+            .map_or(self.query.len(), |(i, _)| i)
     }
 
     fn insert(&mut self, text: &str) {
         let at = self.byte_index(self.cursor);
-        let clean: String =
-            text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+        let clean: String = text
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
         self.query.insert_str(at, &clean);
         self.cursor += clean.chars().count();
         self.refresh();
@@ -245,7 +360,9 @@ impl App {
 
     fn selected_text(&mut self) -> Option<String> {
         let list = self.list();
-        list.hits.get(list.selected).map(|h| list.engine.row(h.index).text.clone())
+        list.hits
+            .get(list.selected)
+            .map(|h| list.engine.row(h.index).text.clone())
     }
 
     /// Enter: act on the selection the way its tab calls for.
@@ -285,11 +402,13 @@ impl App {
         let len = self.query.chars().count();
         match key.code {
             KeyCode::Esc => {
-                if self.query.is_empty() {
+                // Back to the state the search was opened in first; from
+                // there, out.
+                if self.query == self.initial_query {
                     return Step::Done(Outcome::Cancel);
                 }
-                self.query.clear();
-                self.cursor = 0;
+                self.query = self.initial_query.clone();
+                self.cursor = self.query.chars().count();
                 self.refresh();
             }
             KeyCode::Char('c' | 'g') if ctrl => return Step::Done(Outcome::Cancel),
@@ -344,23 +463,31 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         self.animating = false;
+        self.transition.advance();
         let area = frame.area();
         if area.height == 0 || area.width == 0 {
             return;
         }
         let width = usize::from(area.width);
         let prompt_width = self.prompt.width();
+        let alpha = self.transition.alpha();
+        let (shown_query, shown_cursor) = match &self.closing_text {
+            Some(text) => (text.as_str(), text.chars().count()),
+            None => (self.query.as_str(), self.cursor),
+        };
 
         // Bottom up: the tab bar, the query, then the list. The query wraps
         // like a shell edit buffer and takes rows from the list; if it
         // outgrows the viewport, the rows around the cursor win.
         let tab_rows = usize::from(area.height >= 3);
-        let input = layout_input(&self.query, self.cursor, prompt_width, width);
+        let input = layout_input(shown_query, shown_cursor, prompt_width, width);
         let input_rows = input.rows.len().min(usize::from(area.height) - tab_rows);
         let first_input_row = (input.cursor.0 + 1).saturating_sub(input_rows);
         let input_top = area.bottom() - (tab_rows + input_rows) as u16;
         let list_rows = usize::from(area.height) - tab_rows - input_rows;
-        let indent = if prompt_width == 0 { 2 } else { prompt_width }.min(width / 2).max(1);
+        let indent = if prompt_width == 0 { 2 } else { prompt_width }
+            .min(width / 2)
+            .max(1);
 
         self.list();
         let list = match self.tab {
@@ -377,9 +504,13 @@ impl App {
 
         let now = list.engine.now_ms();
 
+        // Nothing but the prompt line shows until the slide is over.
+        let list_rows = if alpha > 0.0 { list_rows } else { 0 };
         for row in 0..list_rows {
             let hit_index = list.offset + row;
-            let Some(hit) = list.hits.get(hit_index).copied() else { break };
+            let Some(hit) = list.hits.get(hit_index).copied() else {
+                break;
+            };
             let y = input_top - 1 - row as u16;
             let selected = hit_index == list.selected;
             let positions = list.engine.match_positions(&self.query, hit.index);
@@ -387,7 +518,9 @@ impl App {
 
             let theme = &self.theme;
             let base = if selected {
-                Style::default().fg(theme.selected).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.selected)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text)
             };
@@ -399,7 +532,11 @@ impl App {
             let age = format_age(now - command.last_used_at);
             let age_width = age.chars().count();
             let show_age = indent + 2 + age_width < width;
-            let avail = if show_age { width - indent - 2 - age_width } else { width - indent };
+            let avail = if show_age {
+                width - indent - 2 - age_width
+            } else {
+                width - indent
+            };
 
             // What tells two long paths apart is their end, so a path that
             // does not fit keeps its tail; a command keeps its head.
@@ -439,17 +576,36 @@ impl App {
             }
             if selected {
                 // Covers the whole row, including the blank columns.
-                frame.buffer_mut().set_style(row_area, Style::default().bg(theme.selected_bg));
+                frame
+                    .buffer_mut()
+                    .set_style(row_area, Style::default().bg(theme.selected_bg));
             }
         }
 
-        for (i, text) in input.rows.iter().enumerate().skip(first_input_row).take(input_rows) {
+        // The prompt line starts on the viewport's first row, where the
+        // shell drew it, and slides down to its place.
+        let travel = f32::from(input_top - area.y);
+        let input_top = area.y + (travel * self.transition.slide()).round() as u16;
+        for (i, text) in input
+            .rows
+            .iter()
+            .enumerate()
+            .skip(first_input_row)
+            .take(input_rows)
+        {
             let y = input_top + (i - first_input_row) as u16;
-            let mut line = if i == 0 { self.prompt.clone() } else { Line::default() };
-            line.spans.push(Span::styled(text.clone(), Style::default().fg(self.theme.query)));
+            let mut line = if i == 0 {
+                self.prompt.clone()
+            } else {
+                Line::default()
+            };
+            line.spans.push(Span::styled(
+                text.clone(),
+                Style::default().fg(self.theme.query),
+            ));
             frame.render_widget(line, Rect::new(area.x, y, area.width, 1));
         }
-        if tab_rows > 0 {
+        if tab_rows > 0 && alpha > 0.0 {
             // Each name is a block padded by a column on either side, the
             // first flush with the left edge so the active tab's background
             // leaves no gap there.
@@ -471,12 +627,107 @@ impl App {
             );
         }
 
-        let (cursor_row, cursor_col) = input.cursor;
-        frame.set_cursor_position((
-            area.x + cursor_col.min(width - 1) as u16,
-            input_top + (cursor_row - first_input_row) as u16,
-        ));
+        if alpha > 0.0
+            && alpha < 1.0
+            && let Some(colors) = &self.colors
+        {
+            let above = Rect::new(area.x, area.y, area.width, input_top - area.y);
+            let below_top = input_top + input_rows as u16;
+            let below = Rect::new(area.x, below_top, area.width, area.bottom() - below_top);
+            fade(frame.buffer_mut(), above, colors, alpha);
+            fade(frame.buffer_mut(), below, colors, alpha);
+        }
+
+        if !self.transition.running() {
+            let (cursor_row, cursor_col) = input.cursor;
+            frame.set_cursor_position((
+                area.x + cursor_col.min(width - 1) as u16,
+                input_top + (cursor_row - first_input_row) as u16,
+            ));
+        }
     }
+}
+
+/// Draws `area` at `alpha` opacity by mixing every color in it toward the
+/// terminal's background.
+fn fade(buffer: &mut Buffer, area: Rect, colors: &TermColors, alpha: f32) {
+    let background = colors.background;
+    let rgb = |(r, g, b): term::Rgb| Color::Rgb(r, g, b);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buffer.cell_mut((x, y)) else {
+                continue;
+            };
+            let fg = colors.resolve(cell.fg, colors.foreground);
+            cell.fg = rgb(term::mix(background, fg, alpha));
+            // A cell without a background of its own already shows the
+            // terminal's.
+            if cell.bg != Color::Reset {
+                let bg = colors.resolve(cell.bg, background);
+                cell.bg = rgb(term::mix(background, bg, alpha));
+            }
+        }
+    }
+}
+
+/// Keys typed before the event loop took over the terminal's input, decoded
+/// from raw bytes. Covers what someone types ahead; other escape sequences
+/// are dropped.
+fn decode_keys(bytes: &[u8]) -> Vec<KeyEvent> {
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    let mut keys = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let (code, len) = match bytes[i..] {
+            [0x1b, b'[' | b'O', b'A', ..] => (KeyCode::Up, 3),
+            [0x1b, b'[' | b'O', b'B', ..] => (KeyCode::Down, 3),
+            [0x1b, b'[' | b'O', b'C', ..] => (KeyCode::Right, 3),
+            [0x1b, b'[' | b'O', b'D', ..] => (KeyCode::Left, 3),
+            [0x1b, b'[' | b'O', ..] => {
+                // Some other sequence: skip to its final byte.
+                let end = bytes[i + 2..]
+                    .iter()
+                    .position(|b| (0x40..=0x7e).contains(b));
+                i += 2 + end.map_or(bytes.len(), |e| e + 1);
+                continue;
+            }
+            [0x1b, ..] => (KeyCode::Esc, 1),
+            [b'\r' | b'\n', ..] => (KeyCode::Enter, 1),
+            [b'\t', ..] => (KeyCode::Tab, 1),
+            [0x7f | 0x08, ..] => (KeyCode::Backspace, 1),
+            [b @ 0x01..=0x1a, ..] => {
+                keys.push(KeyEvent::new(
+                    KeyCode::Char((b'a' + b - 1) as char),
+                    KeyModifiers::CONTROL,
+                ));
+                i += 1;
+                continue;
+            }
+            _ => {
+                // One UTF-8 character; its first byte gives its length.
+                let len = match bytes[i] {
+                    0xc0..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    0xf0..=0xf7 => 4,
+                    _ => 1,
+                };
+                let end = (i + len).min(bytes.len());
+                match std::str::from_utf8(&bytes[i..end])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
+                    Some(c) if !c.is_control() => (KeyCode::Char(c), end - i),
+                    _ => {
+                        i = end;
+                        continue;
+                    }
+                }
+            }
+        };
+        keys.push(key(code));
+        i += len;
+    }
+    keys
 }
 
 /// The query broken into terminal rows, and where the cursor lands.
@@ -556,7 +807,11 @@ fn window(columns: &[Column], offset: usize, len: usize, cyclic: bool) -> Vec<Sp
     let cycle = columns.len() + MARQUEE_GAP;
     let mut spans = Vec::with_capacity(len);
     for i in 0..len {
-        let at = if cyclic { (offset + i) % cycle } else { offset + i };
+        let at = if cyclic {
+            (offset + i) % cycle
+        } else {
+            offset + i
+        };
         match columns.get(at) {
             Some(&Column::Start(c, w, style)) if i + w <= len => {
                 spans.push(Span::styled(c.to_string(), style));
@@ -618,6 +873,9 @@ impl RawMode {
 
 impl Drop for RawMode {
     fn drop(&mut self) {
+        // The cursor is hidden during transitions; an error then must not
+        // leave the shell without one.
+        let _ = crossterm::execute!(io::stdout(), Show);
         let _ = disable_raw_mode();
     }
 }
@@ -628,33 +886,67 @@ pub fn run(sources: Sources, opts: Options) -> Result<Outcome> {
     }
     let _raw = RawMode::enable()?;
 
-    let mut app = App::new(sources, &opts);
     let mut out = io::stdout();
 
     // The shell believes its cursor is here; it must be back here on exit.
-    let (origin_col, _) = crossterm::cursor::position().context("querying cursor position")?;
+    // The same round trip asks for the terminal's colors, if a fade could
+    // use them.
+    let probe = term::probe(term::supports_rgb()).context("querying the terminal")?;
+    let (origin_col, _) = probe.cursor;
+    let mut app = App::new(sources, &opts, probe.colors);
     // The viewport has to start on the prompt's row. If the shell's buffer
     // is wrapped, the cursor is some rows below that.
     let (width, _) = crossterm::terminal::size().context("querying terminal size")?;
-    let rows_below_prompt =
-        layout_input(&app.query, app.cursor, app.prompt.width(), usize::from(width.max(1)))
-            .cursor
-            .0 as u16;
+    let rows_below_prompt = layout_input(
+        &app.query,
+        app.cursor,
+        app.prompt.width(),
+        usize::from(width.max(1)),
+    )
+    .cursor
+    .0 as u16;
     if rows_below_prompt > 0 {
         crossterm::execute!(out, MoveUp(rows_below_prompt))?;
     }
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
-        TerminalOptions { viewport: Viewport::Inline(opts.max_items.max(1).saturating_add(2)) },
+        TerminalOptions {
+            viewport: Viewport::Inline(opts.max_items.max(1).saturating_add(2)),
+        },
     )?;
     // The viewport's first row still shows the shell's prompt line, which
     // ratatui's diffing would otherwise assume is blank.
     terminal.clear()?;
 
+    // Keys that arrived with the terminal's replies come first.
+    for key in decode_keys(&probe.typed) {
+        if let Step::Done(outcome) = app.on_key(key) {
+            app.close(outcome);
+            break;
+        }
+    }
+
     let outcome = loop {
         terminal.draw(|frame| app.draw(frame))?;
+        if app.transition.closed() {
+            break app.transition.outcome.take().unwrap_or(Outcome::Cancel);
+        }
+        if app.transition.closing() {
+            // Input is left unread while closing: it is meant for the shell.
+            std::thread::sleep(FRAME);
+            continue;
+        }
         // Block for input unless the frame just drawn is mid-animation.
-        if app.animating && !event::poll(TICK)? {
+        let wait = if app.transition.running() {
+            Some(FRAME)
+        } else if app.animating {
+            Some(TICK)
+        } else {
+            None
+        };
+        if let Some(wait) = wait
+            && !event::poll(wait)?
+        {
             continue;
         }
         let step = match event::read()? {
@@ -666,15 +958,23 @@ pub fn run(sources: Sources, opts: Options) -> Result<Outcome> {
             _ => Step::Continue,
         };
         if let Step::Done(outcome) = step {
-            break outcome;
+            app.close(outcome);
         }
     };
 
     // Making room may have scrolled the screen, so ask where the viewport
     // ended up rather than reusing the row from before.
     let top = terminal.get_frame().area().y;
-    terminal.clear()?;
-    crossterm::execute!(out, MoveTo(origin_col, top + rows_below_prompt), Show)?;
+    // Erased by hand rather than with `terminal.clear()`, which asks the
+    // terminal for the cursor position and, reading the reply, would swallow
+    // whatever was typed for the shell during the closing transition.
+    crossterm::execute!(
+        out,
+        MoveTo(0, top),
+        Clear(ClearType::FromCursorDown),
+        MoveTo(origin_col, top + rows_below_prompt),
+        Show
+    )?;
     out.flush()?;
     Ok(outcome)
 }
@@ -719,7 +1019,10 @@ mod tests {
     fn window_text(text: &str, offset: usize, len: usize, cyclic: bool) -> String {
         let style = Style::default();
         let columns = text_columns(text, &[], style, style);
-        window(&columns, offset, len, cyclic).iter().map(|s| s.content.as_ref()).collect()
+        window(&columns, offset, len, cyclic)
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
     }
 
     #[test]
@@ -743,10 +1046,70 @@ mod tests {
     fn marquee_rests_then_advances_then_repeats() {
         let cycle = 10;
         assert_eq!(marquee_offset(Duration::ZERO, cycle), 0);
-        assert_eq!(marquee_offset(MARQUEE_PAUSE - Duration::from_millis(1), cycle), 0);
+        assert_eq!(
+            marquee_offset(MARQUEE_PAUSE - Duration::from_millis(1), cycle),
+            0
+        );
         assert_eq!(marquee_offset(MARQUEE_PAUSE + MARQUEE_STEP * 3, cycle), 3);
         let period = MARQUEE_PAUSE + MARQUEE_STEP * cycle as u32;
-        assert_eq!(marquee_offset(period + MARQUEE_PAUSE + MARQUEE_STEP * 3, cycle), 3);
+        assert_eq!(
+            marquee_offset(period + MARQUEE_PAUSE + MARQUEE_STEP * 3, cycle),
+            3
+        );
+    }
+
+    #[test]
+    fn typed_ahead_bytes_decode_to_keys() {
+        let codes = |bytes: &[u8]| -> Vec<KeyCode> {
+            decode_keys(bytes).into_iter().map(|k| k.code).collect()
+        };
+        assert_eq!(
+            codes("g中\x1b[A\x1bOB\r\t\x7f".as_bytes()),
+            [
+                KeyCode::Char('g'),
+                KeyCode::Char('中'),
+                KeyCode::Up,
+                KeyCode::Down,
+                KeyCode::Enter,
+                KeyCode::Tab,
+                KeyCode::Backspace
+            ]
+        );
+        assert_eq!(codes(b"\x1b"), [KeyCode::Esc]);
+        // An unknown sequence is skipped whole, not typed as text.
+        assert_eq!(codes(b"\x1b[1;5Hx"), [KeyCode::Char('x')]);
+        let ctrl = decode_keys(b"\x10");
+        assert_eq!(ctrl[0].code, KeyCode::Char('p'));
+        assert!(ctrl[0].modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn transition_slides_then_fades_and_reverses() {
+        let mut t = Transition::new(true);
+        assert_eq!((t.slide(), t.alpha()), (0.0, 0.0));
+        t.elapsed = SLIDE / 2;
+        assert!(t.slide() > 0.5 && t.slide() < 1.0, "eases out");
+        assert_eq!(t.alpha(), 0.0);
+        t.elapsed = SLIDE + FADE / 2;
+        assert_eq!(t.slide(), 1.0);
+        assert!((t.alpha() - 0.5).abs() < 0.01);
+        t.elapsed = SLIDE + FADE;
+        assert!(!t.running());
+
+        t.outcome = Some(Outcome::Cancel);
+        assert!(t.running() && !t.closed());
+        t.elapsed = Duration::ZERO;
+        assert!(t.closed());
+    }
+
+    #[test]
+    fn without_colors_the_list_appears_when_the_slide_ends() {
+        let mut t = Transition::new(false);
+        t.elapsed = SLIDE - Duration::from_millis(1);
+        assert_eq!(t.alpha(), 0.0);
+        t.elapsed = SLIDE;
+        assert_eq!(t.alpha(), 1.0);
+        assert!(!t.running());
     }
 
     #[test]
