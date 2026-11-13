@@ -13,6 +13,8 @@ use unicode_width::UnicodeWidthChar;
 use super::app::{App, Geometry, Tab};
 use super::input::layout_input;
 use super::term::{self, TermColors};
+use super::theme::Theme;
+use crate::item::Run;
 
 /// How long an overflowing selected row rests at its start before scrolling.
 pub(super) const MARQUEE_PAUSE: Duration = Duration::from_millis(800);
@@ -22,6 +24,15 @@ pub(super) const MARQUEE_STEP: Duration = Duration::from_millis(120);
 pub(super) const MARQUEE_GAP: usize = 4;
 /// Redraw interval while something is animating.
 pub(super) const TICK: Duration = Duration::from_millis(40);
+
+/// Marks a command whose last run failed.
+const MARK_FAILED: &str = "✗";
+/// Marks a command that has been run in the current directory.
+const MARK_HERE: &str = "⌂";
+/// Columns taken by the marks: one each, a blank between.
+const MARKS_WIDTH: usize = 3;
+/// Columns taken by an age; the longest is `12mo`.
+const AGE_WIDTH: usize = 4;
 
 impl App {
     pub(super) fn draw(&mut self, frame: &mut Frame) {
@@ -52,35 +63,59 @@ impl App {
             .min(width / 2)
             .max(1);
 
+        // Looked up before the list is borrowed. It needs a row of its own,
+        // and the selected command's row above it.
+        let run = if list_rows >= 2 {
+            self.selected_run()
+        } else {
+            None
+        };
+        let max_items = self.max_items;
+        let home = self.home.clone();
         self.list();
         let list = match self.tab {
             Tab::Commands => &mut self.commands,
             Tab::Directories => self.directories.as_mut().expect("loaded by `list`"),
         };
 
-        self.geometry = Geometry {
-            first_row_y: input_top.saturating_sub(1),
-            list_rows,
-            tab_y: (tab_rows > 0).then(|| area.bottom() - 1),
+        // The selected candidate takes a second row for its last run.
+        let selected_index = list.selected;
+        let height = |i: usize| {
+            if i == selected_index && run.is_some() {
+                2
+            } else {
+                1
+            }
+        };
+        // Whether the candidates from `first` to `last` fit at once.
+        let fits = |first: usize, last: usize| {
+            last + 1 - first <= max_items && (first..=last).map(height).sum::<usize>() <= list_rows
         };
 
         // Keep the selection inside the visible window.
         if list.selected < list.offset {
             list.offset = list.selected;
-        } else if list_rows > 0 && list.selected >= list.offset + list_rows {
-            list.offset = list.selected + 1 - list_rows;
+        }
+        while list.offset < list.selected && !fits(list.offset, list.selected) {
+            list.offset += 1;
+        }
+        let mut shown = 0;
+        while list.offset + shown < list.hits.len() && fits(list.offset, list.offset + shown) {
+            shown += 1;
         }
 
         let now = list.engine.now_ms();
+        let mut rows = Vec::new();
 
         // Nothing but the prompt line shows until the slide is over.
-        let list_rows = if alpha > 0.0 { list_rows } else { 0 };
-        for row in 0..list_rows {
+        let shown_now = if alpha > 0.0 { shown } else { 0 };
+        let mut bottom = input_top;
+        for row in 0..shown_now {
             let hit_index = list.offset + row;
-            let Some(hit) = list.hits.get(hit_index).copied() else {
-                break;
-            };
-            let y = input_top - 1 - row as u16;
+            let hit = list.hits[hit_index];
+            let rows_taken = height(hit_index) as u16;
+            let y = bottom - rows_taken;
+            bottom = y;
             let selected = hit_index == list.selected;
             let positions = list.engine.match_positions(&self.query, hit.index);
             let command = list.engine.row(hit.index);
@@ -96,13 +131,24 @@ impl App {
             let muted = Style::default().fg(theme.muted);
             let columns = text_columns(&command.text, &positions, base, base.fg(theme.matched));
 
-            // The age is pinned to the right edge; the command gets what is
-            // left between the indent and it.
-            let age = format_age(now - command.last_used_at);
-            let age_width = age.chars().count();
-            let show_age = indent + 2 + age_width < width;
-            let avail = if show_age {
-                width - indent - 2 - age_width
+            // The marks and the age are pinned to the right edge, each in a
+            // column of its own so they line up from row to row; the text
+            // gets what is left between the indent and them. Without room
+            // the marks go first, then the age.
+            let full = if self.tab == Tab::Commands {
+                MARKS_WIDTH + 1 + AGE_WIDTH
+            } else {
+                AGE_WIDTH
+            };
+            let right_width = if indent + 2 + full < width {
+                full
+            } else if indent + 2 + AGE_WIDTH < width {
+                AGE_WIDTH
+            } else {
+                0
+            };
+            let avail = if right_width > 0 {
+                width - indent - 2 - right_width
             } else {
                 width - indent
             };
@@ -129,20 +175,60 @@ impl App {
                 spans
             };
 
-            let marker = if selected { "▌" } else { " " };
-            let mut spans = vec![
-                Span::styled(marker, Style::default().fg(theme.marker)),
-                Span::raw(" ".repeat(indent - 1)),
-            ];
+            let lead = || {
+                let marker = if selected { "▌" } else { " " };
+                vec![
+                    Span::styled(marker, Style::default().fg(theme.marker)),
+                    Span::raw(" ".repeat(indent - 1)),
+                ]
+            };
+            let mut spans = lead();
             spans.extend(text);
-            let row_area = Rect::new(area.x, y, area.width, 1);
-            frame.render_widget(Line::from(spans), row_area);
-            if show_age {
+            let row_area = Rect::new(area.x, y, area.width, rows_taken);
+            frame.render_widget(
+                Line::from(spans),
+                Rect {
+                    height: 1,
+                    ..row_area
+                },
+            );
+            rows.push((y, hit_index));
+
+            if right_width > 0 {
+                let mut right = Vec::new();
+                if right_width > AGE_WIDTH {
+                    let mark = |on: bool, icon: &'static str, color: Color| {
+                        if on {
+                            Span::styled(icon, Style::default().fg(color))
+                        } else {
+                            Span::raw(" ")
+                        }
+                    };
+                    right.push(mark(command.failed(), MARK_FAILED, theme.error));
+                    right.push(Span::raw(" "));
+                    right.push(mark(command.cwd_count > 0, MARK_HERE, theme.here));
+                    right.push(Span::raw(" "));
+                }
+                // The selected row's age matches its text, so the selection
+                // shows at the right edge too.
+                let age = format_age(now - command.last_used_at);
+                let age_style = if selected { base } else { muted };
+                right.push(Span::styled(format!("{age:>AGE_WIDTH$}"), age_style));
                 frame.render_widget(
-                    Span::styled(age, muted),
-                    Rect::new(area.right() - age_width as u16, y, age_width as u16, 1),
+                    Line::from(right),
+                    Rect::new(area.right() - right_width as u16, y, right_width as u16, 1),
                 );
             }
+
+            if rows_taken == 2
+                && let Some(run) = &run
+            {
+                let mut spans = lead();
+                spans.extend(run_spans(run, now, home.as_deref(), width - indent, theme));
+                frame.render_widget(Line::from(spans), Rect::new(area.x, y + 1, area.width, 1));
+                rows.push((y + 1, hit_index));
+            }
+
             if selected {
                 // Covers the whole row, including the blank columns.
                 frame
@@ -150,6 +236,12 @@ impl App {
                     .set_style(row_area, Style::default().bg(theme.selected_bg));
             }
         }
+
+        self.geometry = Geometry {
+            rows,
+            shown,
+            tab_y: (tab_rows > 0).then(|| area.bottom() - 1),
+        };
 
         // The prompt line starts on the viewport's first row, where the
         // shell drew it, and slides down to its place.
@@ -329,6 +421,159 @@ pub(super) fn parse_prompt(prompt: &str) -> Line<'static> {
     }
 }
 
+/// The line under the selected command: where and when it last ran, how
+/// long it took and how it ended, cut to `width` columns. Imported runs
+/// know only some of this; what is unknown is left out.
+pub(super) fn run_spans(
+    run: &Run,
+    now_ms: i64,
+    home: Option<&str>,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let muted = Style::default().fg(theme.muted);
+    let mut parts: Vec<(String, Style)> = Vec::new();
+    if let Some(ms) = run.duration_ms {
+        parts.push((format_duration(ms), muted));
+    }
+    match run.exit_code {
+        None | Some(0) => {}
+        Some(130) => parts.push(("interrupted".to_string(), muted)),
+        Some(code) => parts.push((format!("exit {code}"), Style::default().fg(theme.error))),
+    }
+    if let (Some(at), Some(now)) = (clock(run.started_at), clock(now_ms)) {
+        parts.push((format_clock(&at, &now), muted));
+    }
+    if let Some(host) = &run.hostname {
+        parts.push((format!("on {host}"), muted));
+    }
+
+    // The directory comes first and gives up its head when space is short.
+    // Everything after it is preceded by a separator.
+    const SEP: &str = " · ";
+    let rest: usize = parts
+        .iter()
+        .map(|(text, _)| text_width(SEP) + text_width(text))
+        .sum();
+    if let Some(cwd) = &run.cwd {
+        let cwd = tilde(cwd, home);
+        let room = width.saturating_sub(rest);
+        let fitted = if text_width(&cwd) <= room {
+            Some(cwd)
+        } else if room >= 8 {
+            Some(keep_tail(&cwd, room))
+        } else {
+            None
+        };
+        if let Some(cwd) = fitted {
+            parts.insert(0, (cwd, muted));
+        }
+    }
+
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (i, (text, style)) in parts.into_iter().enumerate() {
+        // The separator is always muted, whatever the part after it is.
+        let sep = if i == 0 { "" } else { SEP };
+        let w = text_width(sep) + text_width(&text);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        if !sep.is_empty() {
+            spans.push(Span::styled(sep, muted));
+        }
+        spans.push(Span::styled(text, style));
+    }
+    spans
+}
+
+/// Width in columns of `text` as drawn.
+fn text_width(text: &str) -> usize {
+    text.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// The end of `text` that fits in `width` columns, after an ellipsis.
+fn keep_tail(text: &str, width: usize) -> String {
+    let mut tail = Vec::new();
+    let mut used = 1;
+    for c in text.chars().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        tail.push(c);
+    }
+    std::iter::once('…').chain(tail.into_iter().rev()).collect()
+}
+
+/// `path` with the home directory written as `~`.
+pub(super) fn tilde(path: &str, home: Option<&str>) -> String {
+    match home.and_then(|h| path.strip_prefix(h)) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+pub(super) fn format_duration(ms: i64) -> String {
+    let ms = ms.max(0);
+    match ms {
+        0..1000 => format!("{ms}ms"),
+        1000..10_000 => format!("{:.1}s", ms as f64 / 1000.0),
+        10_000..60_000 => format!("{}s", ms / 1000),
+        60_000..3_600_000 => format!("{}m {}s", ms / 60_000, ms / 1000 % 60),
+        _ => format!("{}h {}m", ms / 3_600_000, ms / 60_000 % 60),
+    }
+}
+
+/// A moment in local time, as much of it as is shown.
+pub(super) struct Clock {
+    year: i32,
+    day_of_year: i32,
+    /// 0 is January.
+    month: usize,
+    day: i32,
+    hour: i32,
+    minute: i32,
+}
+
+fn clock(ms: i64) -> Option<Clock> {
+    let t = ms.div_euclid(1000) as libc::time_t;
+    // SAFETY: `tm` is plain data, and both pointers are valid for the call.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return None;
+    }
+    Some(Clock {
+        year: tm.tm_year + 1900,
+        day_of_year: tm.tm_yday,
+        month: tm.tm_mon as usize,
+        day: tm.tm_mday,
+        hour: tm.tm_hour,
+        minute: tm.tm_min,
+    })
+}
+
+/// The time of day for today, the date and time for earlier this year, and
+/// the date before that. The age next to the command already says how long
+/// ago; this says when.
+pub(super) fn format_clock(at: &Clock, now: &Clock) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let month = MONTHS.get(at.month).copied().unwrap_or("?");
+    let time = format!("{:02}:{:02}", at.hour, at.minute);
+    if at.year != now.year {
+        format!("{month} {} {}", at.day, at.year)
+    } else if at.day_of_year != now.day_of_year {
+        format!("{month} {} {time}", at.day)
+    } else {
+        time
+    }
+}
+
 pub(super) fn format_age(ms: i64) -> String {
     let s = ms.max(0) / 1000;
     match s {
@@ -394,6 +639,86 @@ mod tests {
             marquee_offset(period + MARQUEE_PAUSE + MARQUEE_STEP * 3, cycle),
             3
         );
+    }
+
+    #[test]
+    fn durations() {
+        assert_eq!(format_duration(120), "120ms");
+        assert_eq!(format_duration(3_240), "3.2s");
+        assert_eq!(format_duration(38_000), "38s");
+        assert_eq!(format_duration(125_000), "2m 5s");
+        assert_eq!(format_duration(3_780_000), "1h 3m");
+    }
+
+    #[test]
+    fn home_is_written_as_tilde() {
+        let home = Some("/Users/me");
+        assert_eq!(tilde("/Users/me", home), "~");
+        assert_eq!(tilde("/Users/me/src", home), "~/src");
+        assert_eq!(tilde("/Users/meg", home), "/Users/meg");
+        assert_eq!(tilde("/tmp", None), "/tmp");
+    }
+
+    #[test]
+    fn clock_shows_less_the_closer_it_is() {
+        let at = |year, day_of_year, month, day| Clock {
+            year,
+            day_of_year,
+            month,
+            day,
+            hour: 9,
+            minute: 5,
+        };
+        let now = at(2026, 317, 10, 14);
+        assert_eq!(format_clock(&at(2026, 317, 10, 14), &now), "09:05");
+        assert_eq!(format_clock(&at(2026, 315, 10, 12), &now), "Nov 12 09:05");
+        assert_eq!(format_clock(&at(2025, 315, 10, 12), &now), "Nov 12 2025");
+    }
+
+    fn run_text(run: &Run, width: usize) -> String {
+        run_spans(
+            run,
+            run.started_at,
+            Some("/home/me"),
+            width,
+            &Theme::default(),
+        )
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect()
+    }
+
+    #[test]
+    fn run_line_leaves_out_what_is_unknown_and_shortens_the_directory() {
+        let mut run = Run {
+            started_at: 0,
+            duration_ms: Some(38_000),
+            exit_code: Some(1),
+            cwd: Some("/home/me/work/zray".into()),
+            hostname: Some("box".into()),
+        };
+        let full = run_text(&run, 80);
+        assert!(full.starts_with("~/work/zray · 38s · exit 1 · "), "{full}");
+        assert!(full.ends_with(" · on box"), "{full}");
+
+        // Only the exit code takes the error color, not the separator before it.
+        let theme = Theme::default();
+        let spans = run_spans(&run, 0, Some("/home/me"), 80, &theme);
+        let red: Vec<&str> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(theme.error))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(red, ["exit 1"]);
+
+        let narrow = run_text(&run, text_width(&full) - 3);
+        assert!(narrow.starts_with("…rk/zray · 38s"), "{narrow}");
+
+        run.exit_code = Some(0);
+        run.hostname = None;
+        run.cwd = None;
+        run.duration_ms = None;
+        assert!(!run_text(&run, 80).contains('·'), "only the time is left");
     }
 
     #[test]

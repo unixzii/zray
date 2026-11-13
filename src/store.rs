@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::item::Item;
+use crate::item::{Item, Run};
 
 /// Session id used for rows imported from a zsh history file.
 const IMPORT_SESSION: &str = "import";
@@ -262,6 +262,32 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The most recent execution of `text`, if it was ever run.
+    pub fn last_run(&self, text: &str) -> Result<Option<Run>> {
+        let run = self
+            .conn
+            .query_row(
+                "SELECT e.started_at, e.duration_ms, e.exit_code, e.cwd, e.hostname
+                 FROM executions e JOIN commands c ON c.id = e.command_id
+                 WHERE c.text = ?1
+                 ORDER BY e.started_at DESC, e.id DESC
+                 LIMIT 1",
+                params![text],
+                |r| {
+                    let nonempty = |s: Option<String>| s.filter(|s| !s.is_empty());
+                    Ok(Run {
+                        started_at: r.get(0)?,
+                        duration_ms: r.get(1)?,
+                        exit_code: r.get(2)?,
+                        cwd: nonempty(r.get(3)?),
+                        hostname: nonempty(r.get(4)?),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(run)
+    }
+
     /// The `limit` most recently used directories, newest first.
     pub fn load_directories(&self, limit: usize) -> Result<Vec<Item>> {
         let mut stmt = self.conn.prepare(
@@ -309,6 +335,26 @@ mod tests {
         assert_eq!(git.cwd_count, 1);
         let ls = rows.iter().find(|r| r.text == "ls").unwrap();
         assert_eq!(ls.last_exit, None);
+    }
+
+    #[test]
+    fn last_run_is_the_latest_execution() {
+        let mut s = Store::open_in_memory().unwrap();
+        let a = s
+            .record_start("make", Some("/a"), Some("s1"), Some("box"))
+            .unwrap();
+        s.record_end(a, 0).unwrap();
+        let b = s
+            .record_start("make", Some("/b"), Some("s1"), None)
+            .unwrap();
+        s.record_end(b, 2).unwrap();
+
+        let run = s.last_run("make").unwrap().unwrap();
+        assert_eq!(run.cwd.as_deref(), Some("/b"));
+        assert_eq!(run.exit_code, Some(2));
+        assert_eq!(run.hostname, None);
+        assert!(run.duration_ms.is_some());
+        assert_eq!(s.last_run("nope").unwrap(), None);
     }
 
     #[test]

@@ -50,11 +50,7 @@ impl Ranker for DefaultRanker {
         let frecency =
             Self::recency_weight(age) * (4.0 + 3.0 * f64::from(row.count).ln_1p().min(4.0));
         let cwd = if row.cwd_count > 0 { 6.0 } else { 0.0 };
-        // 130 is Ctrl-C, which says nothing about the command being wrong.
-        let failed = match row.last_exit {
-            Some(code) if code != 0 && code != 130 => -4.0,
-            _ => 0.0,
-        };
+        let failed = if row.failed() { -4.0 } else { 0.0 };
         f64::from(fuzzy) + frecency + cwd + failed
     }
 }

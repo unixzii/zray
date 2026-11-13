@@ -1,6 +1,7 @@
 //! The search box's state and how keys and the mouse change it. Drawing is
 //! in `view`.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::time::Instant;
 
@@ -11,17 +12,19 @@ use super::term::TermColors;
 use super::theme::Theme;
 use super::transition::Transition;
 use super::view::parse_prompt;
-use super::{DISABLE_MOUSE, Options, Outcome, Sources};
+use super::{DISABLE_MOUSE, LastRun, Options, Outcome, Sources};
+use crate::item::Run;
 use crate::matcher::{Engine, Hit};
 
 /// Where things were drawn in the last frame, for finding what the mouse
 /// is pointing at.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub(super) struct Geometry {
-    /// Screen row of the candidate nearest the input.
-    pub(super) first_row_y: u16,
-    /// How many candidates fit.
-    pub(super) list_rows: usize,
+    /// Each screen row of the list with the index into `hits` of the
+    /// candidate drawn there. The selected candidate may take two rows.
+    pub(super) rows: Vec<(u16, usize)>,
+    /// How many candidates were shown.
+    pub(super) shown: usize,
     /// Screen row of the tab bar, if it is showing.
     pub(super) tab_y: Option<u16>,
 }
@@ -113,6 +116,14 @@ pub(super) struct App {
     /// Whether the last frame needs redrawing on a timer.
     pub(super) animating: bool,
     pub(super) geometry: Geometry,
+    /// The most candidates to show at once.
+    pub(super) max_items: usize,
+    /// Looks up a command's last run.
+    pub(super) last_run: LastRun,
+    /// Last runs looked up so far, by index into the commands engine.
+    pub(super) runs: HashMap<usize, Option<Run>>,
+    /// `$HOME`, shown as `~` in paths.
+    pub(super) home: Option<String>,
 }
 
 impl App {
@@ -135,6 +146,10 @@ impl App {
             selected_at: Instant::now(),
             animating: false,
             geometry: Geometry::default(),
+            max_items: usize::from(opts.max_items.max(1)),
+            last_run: sources.last_run,
+            runs: HashMap::new(),
+            home: std::env::var("HOME").ok().filter(|h| !h.is_empty()),
         };
         app.refresh();
         app
@@ -239,6 +254,20 @@ impl App {
         i
     }
 
+    /// The last run of the selected command, if the commands tab is showing.
+    pub(super) fn selected_run(&mut self) -> Option<Run> {
+        if self.tab != Tab::Commands {
+            return None;
+        }
+        let index = self.commands.hits.get(self.commands.selected)?.index;
+        if let Some(run) = self.runs.get(&index) {
+            return run.clone();
+        }
+        let run = (self.last_run)(&self.commands.engine.row(index).text);
+        self.runs.insert(index, run.clone());
+        run
+    }
+
     pub(super) fn selected_text(&mut self) -> Option<String> {
         let list = self.list();
         list.hits
@@ -292,18 +321,19 @@ impl App {
     }
 
     pub(super) fn on_mouse(&mut self, mouse: MouseEvent) {
-        let Geometry {
-            first_row_y,
-            list_rows,
-            tab_y,
-        } = self.geometry;
         match mouse.kind {
             // The list grows upward, so rolling the wheel up brings later
             // candidates into view.
             MouseEventKind::ScrollUp => self.scroll(1),
             MouseEventKind::ScrollDown => self.scroll(-1),
             MouseEventKind::Down(MouseButton::Left) => {
-                if Some(mouse.row) == tab_y {
+                let row = self
+                    .geometry
+                    .rows
+                    .iter()
+                    .find(|(y, _)| *y == mouse.row)
+                    .map(|&(_, index)| index);
+                if Some(mouse.row) == self.geometry.tab_y {
                     let mut x = 0;
                     for tab in Tab::ALL {
                         let width = tab.label().len() as u16 + 2;
@@ -313,11 +343,8 @@ impl App {
                         }
                         x += width;
                     }
-                } else if mouse.row <= first_row_y
-                    && usize::from(first_row_y - mouse.row) < list_rows
-                {
+                } else if let Some(index) = row {
                     let list = self.list();
-                    let index = list.offset + usize::from(first_row_y - mouse.row);
                     if index < list.hits.len() && index != list.selected {
                         list.selected = index;
                         self.selected_at = Instant::now();
@@ -331,7 +358,7 @@ impl App {
     /// Scrolls the list by `delta` rows without moving the selection,
     /// unless it would leave the window; then it rides the edge.
     pub(super) fn scroll(&mut self, delta: isize) {
-        let rows = self.geometry.list_rows;
+        let rows = self.geometry.shown;
         let list = self.list();
         let max_offset = list.hits.len().saturating_sub(rows);
         let offset = list.offset.saturating_add_signed(delta).min(max_offset);
@@ -349,7 +376,7 @@ impl App {
     pub(super) fn on_key(&mut self, key: KeyEvent) -> Step {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let page = self.geometry.list_rows.max(1) as isize;
+        let page = self.geometry.shown.max(1) as isize;
         let len = self.query.chars().count();
         match key.code {
             KeyCode::Esc => {
@@ -428,18 +455,33 @@ mod tests {
     use super::*;
 
     fn app(texts: &[&str], query: &str) -> App {
+        app_with(texts, query, |_| {}, Box::new(|_| None))
+    }
+
+    /// Commands listed newest first, each changed by `tweak`, with last runs
+    /// from `last_run`.
+    fn app_with(
+        texts: &[&str],
+        query: &str,
+        tweak: impl Fn(&mut crate::item::Item),
+        last_run: LastRun,
+    ) -> App {
         use crate::item::Item;
         use crate::ranker::{DefaultRanker, RankContext};
         let n = texts.len() as i64;
         let items = texts
             .iter()
             .enumerate()
-            .map(|(i, t)| Item {
-                text: t.to_string(),
-                count: 1,
-                last_used_at: n - i as i64,
-                last_exit: None,
-                cwd_count: 0,
+            .map(|(i, t)| {
+                let mut item = Item {
+                    text: t.to_string(),
+                    count: 1,
+                    last_used_at: n - i as i64,
+                    last_exit: None,
+                    cwd_count: 0,
+                };
+                tweak(&mut item);
+                item
             })
             .collect();
         let ctx = RankContext { now_ms: n };
@@ -455,6 +497,7 @@ mod tests {
                 };
                 Engine::for_paths(vec![dir], Box::new(DefaultRanker), ctx)
             }),
+            last_run,
         };
         let opts = Options {
             query: query.to_string(),
@@ -466,10 +509,45 @@ mod tests {
         App::new(sources, &opts, None)
     }
 
+    /// Draws a frame with the opening transition over; returns the screen
+    /// one string per row, trailing blanks trimmed.
+    fn render(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        app.transition.elapsed = std::time::Duration::from_secs(1);
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                let row: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                row.trim_end().to_string()
+            })
+            .collect()
+    }
+
+    fn run() -> Run {
+        Run {
+            started_at: 0,
+            duration_ms: Some(38_000),
+            exit_code: Some(1),
+            cwd: Some("/w".into()),
+            hostname: None,
+        }
+    }
+
     fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Option<Outcome> {
         match app.on_key(KeyEvent::new(code, modifiers)) {
             Step::Done(outcome) => Some(outcome),
             Step::Continue => None,
+        }
+    }
+
+    /// Five one-row candidates, the first on screen row 10.
+    fn geometry() -> Geometry {
+        Geometry {
+            rows: (0..5).map(|i| (10 - i as u16, i)).collect(),
+            shown: 5,
+            tab_y: Some(12),
         }
     }
 
@@ -531,11 +609,7 @@ mod tests {
     fn wheel_scrolls_the_window_and_carries_the_selection_at_its_edge() {
         let texts: Vec<String> = (0..20).map(|i| format!("cmd {i}")).collect();
         let mut app = app(&texts.iter().map(String::as_str).collect::<Vec<_>>(), "");
-        app.geometry = Geometry {
-            first_row_y: 10,
-            list_rows: 5,
-            tab_y: Some(12),
-        };
+        app.geometry = geometry();
 
         app.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
         assert_eq!((app.commands.offset, app.commands.selected), (1, 1));
@@ -564,11 +638,7 @@ mod tests {
     fn page_keys_move_by_a_screenful() {
         let texts: Vec<String> = (0..20).map(|i| format!("cmd {i}")).collect();
         let mut app = app(&texts.iter().map(String::as_str).collect::<Vec<_>>(), "");
-        app.geometry = Geometry {
-            first_row_y: 10,
-            list_rows: 5,
-            tab_y: Some(12),
-        };
+        app.geometry = geometry();
         press(&mut app, KeyCode::PageUp, KeyModifiers::NONE);
         assert_eq!(app.commands.selected, 5);
         press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
@@ -579,11 +649,7 @@ mod tests {
     #[test]
     fn clicks_select_rows_and_switch_tabs() {
         let mut app = app(&["a", "b", "c"], "");
-        app.geometry = Geometry {
-            first_row_y: 10,
-            list_rows: 5,
-            tab_y: Some(12),
-        };
+        app.geometry = geometry();
         let click = |x, y| mouse(MouseEventKind::Down(MouseButton::Left), x, y);
 
         app.on_mouse(click(7, 8));
@@ -602,5 +668,64 @@ mod tests {
         );
         app.on_mouse(click(0, 12));
         assert_eq!(app.tab, Tab::Commands);
+    }
+
+    #[test]
+    fn selected_command_shows_its_last_run_and_marks_line_up() {
+        let mut app = app_with(
+            &["make", "ls"],
+            "",
+            |item| {
+                if item.text == "make" {
+                    item.last_exit = Some(2);
+                    item.cwd_count = 1;
+                } else {
+                    item.cwd_count = 1;
+                }
+            },
+            Box::new(|_| Some(run())),
+        );
+        let screen = render(&mut app, 30, 6);
+        // Rows 0..4 are the list, 4 the input, 5 the tab bar.
+        // The marks sit in fixed columns, 22 and 24, before the age.
+        assert_eq!(screen[1], format!("  ls{}⌂  now", " ".repeat(20)));
+        assert_eq!(screen[2], format!("▌ make{}✗ ⌂  now", " ".repeat(16)));
+        assert!(
+            screen[3].starts_with("▌ /w · 38s · exit 1 · "),
+            "{screen:?}"
+        );
+        // Both rows of the selection belong to it.
+        assert_eq!(app.geometry.rows, [(2, 0), (3, 0), (1, 1)]);
+
+        // Moving the selection moves the line with it.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        let screen = render(&mut app, 30, 6);
+        assert!(screen[3].starts_with("  make"), "{screen:?}");
+        assert!(screen[1].starts_with("▌ ls"), "{screen:?}");
+        assert!(screen[2].starts_with("▌ /w"), "{screen:?}");
+    }
+
+    #[test]
+    fn the_selection_with_its_last_run_stays_in_view() {
+        let texts: Vec<String> = (0..20).map(|i| format!("cmd {i}")).collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut app = app_with(&texts, "", |_| {}, Box::new(|_| Some(run())));
+        // Six rows for the list: five one-row candidates, or four and the
+        // selected one with its second row.
+        app.commands.selected = 5;
+        render(&mut app, 40, 8);
+        assert_eq!((app.commands.offset, app.geometry.shown), (1, 5));
+        app.commands.selected = 0;
+        render(&mut app, 40, 8);
+        assert_eq!((app.commands.offset, app.geometry.shown), (0, 5));
+    }
+
+    #[test]
+    fn without_a_last_run_the_selection_takes_one_row() {
+        let texts: Vec<String> = (0..20).map(|i| format!("cmd {i}")).collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let mut app = app(&texts, "");
+        render(&mut app, 40, 8);
+        assert_eq!(app.geometry.shown, 6);
     }
 }

@@ -14,3 +14,26 @@ pub struct Item {
     /// How many times it was used in the directory being searched from.
     pub cwd_count: u32,
 }
+
+impl Item {
+    /// Whether the last run failed. Exit code 130 is Ctrl-C, which says
+    /// nothing about the command being wrong.
+    pub fn failed(&self) -> bool {
+        matches!(self.last_exit, Some(code) if code != 0 && code != 130)
+    }
+}
+
+/// One execution of a command, as shown under the selected candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    /// Milliseconds since the Unix epoch.
+    pub started_at: i64,
+    /// `None` if it has not finished, or was imported without a duration.
+    pub duration_ms: Option<i64>,
+    /// `None` if it has not finished, or was imported.
+    pub exit_code: Option<i32>,
+    /// Working directory; `None` for imported runs.
+    pub cwd: Option<String>,
+    /// Machine it ran on; `None` if unknown.
+    pub hostname: Option<String>,
+}

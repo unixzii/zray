@@ -28,6 +28,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
+use crate::item::Run;
 use crate::matcher::Engine;
 use app::{App, Step};
 use input::{decode_keys, layout_input};
@@ -46,8 +47,9 @@ pub struct Options {
     /// The last line of the shell prompt, possibly with ANSI escapes.
     pub prompt: String,
     /// The most candidates to show at once. The viewport is this tall plus
-    /// a row each for the input line and the tab bar; a query that wraps
-    /// takes its extra rows from the candidates.
+    /// a row each for the selected command's last run, the input line and
+    /// the tab bar; a query that wraps takes its extra rows from the
+    /// candidates.
     pub max_items: u16,
     pub theme: Theme,
 }
@@ -57,7 +59,12 @@ pub struct Options {
 pub struct Sources {
     pub commands: Engine,
     pub directories: Box<dyn FnOnce() -> Engine>,
+    /// The most recent run of a command, shown under it when it is selected.
+    pub last_run: LastRun,
 }
+
+/// Looks up the most recent run of a command.
+pub type LastRun = Box<dyn FnMut(&str) -> Option<Run>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -132,7 +139,7 @@ pub fn run(sources: Sources, opts: Options) -> Result<Outcome> {
     let mut terminal = Terminal::with_options(
         CrosstermBackend::new(io::stdout()),
         TerminalOptions {
-            viewport: Viewport::Inline(opts.max_items.max(1).saturating_add(2)),
+            viewport: Viewport::Inline(opts.max_items.max(1).saturating_add(3)),
         },
     )?;
     // The viewport's first row still shows the shell's prompt line, which

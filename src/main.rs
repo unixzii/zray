@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
@@ -159,21 +160,33 @@ fn search(
             .ok()
             .and_then(|p| p.to_str().map(str::to_string))
     });
-    let store = Store::open_default()?;
+    let store = Rc::new(Store::open_default()?);
     let ctx = RankContext { now_ms: now_ms() };
     let commands = Engine::new(
         store.load_commands(cwd.as_deref(), CANDIDATE_LIMIT)?,
         Box::new(DefaultRanker),
         ctx.clone(),
     );
+    let directories_store = Rc::clone(&store);
     let directories = Box::new(move || {
         // Errors cannot be shown while the TUI owns the screen; an empty
         // tab is the visible symptom.
-        let mut dirs = store.load_directories(DIRECTORY_LIMIT).unwrap_or_default();
+        let mut dirs = directories_store
+            .load_directories(DIRECTORY_LIMIT)
+            .unwrap_or_default();
         // Skip where we already are, and directories that are gone. They
         // stay in the database: the volume may just not be mounted.
         dirs.retain(|d| Some(&d.text) != cwd.as_ref() && Path::new(&d.text).is_dir());
         Engine::for_paths(dirs, Box::new(DefaultRanker), ctx)
+    });
+    // The machine is worth naming only when it is not this one.
+    let host = hostname();
+    let last_run = Box::new(move |text: &str| {
+        let mut run = store.last_run(text).ok().flatten()?;
+        if run.hostname == host {
+            run.hostname = None;
+        }
+        Some(run)
     });
     // Problems in the theme are not reported here: anything printed now
     // would land in the middle of the prompt. `zray theme` reports them.
@@ -182,6 +195,7 @@ fn search(
         Sources {
             commands,
             directories,
+            last_run,
         },
         tui::Options {
             query,
@@ -214,6 +228,17 @@ fn search(
         None => print!("{result}"),
     }
     Ok(())
+}
+
+/// This machine's name, as zsh's `$HOST` has it.
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for its whole length.
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0)?;
+    String::from_utf8(buf[..end].to_vec()).ok()
 }
 
 fn show_theme() -> Result<()> {

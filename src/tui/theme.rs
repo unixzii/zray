@@ -22,8 +22,13 @@ pub struct Theme {
     pub matched: Color,
     /// The bar marking the selected row.
     pub marker: Color,
-    /// Secondary information: ages and the truncation ellipsis.
+    /// Secondary information: ages, the selected command's last run, and
+    /// the truncation ellipsis.
     pub muted: Color,
+    /// The mark of a command whose last run failed, and its exit code.
+    pub error: Color,
+    /// The mark of a command that has been run in the current directory.
+    pub here: Color,
     /// The text typed into the search box.
     pub query: Color,
     /// The name of the tab being shown.
@@ -45,6 +50,8 @@ impl Default for Theme {
             matched: Color::Red,
             marker: Color::Cyan,
             muted: Color::DarkGray,
+            error: Color::Red,
+            here: Color::Blue,
             query: Color::Reset,
             tab_active: Color::White,
             tab_active_bg: Color::Black,
@@ -55,13 +62,15 @@ impl Default for Theme {
 
 impl Theme {
     /// Token names as written in `$ZRAY_THEME`, in display order.
-    pub const TOKENS: [&'static str; 10] = [
+    pub const TOKENS: [&'static str; 12] = [
         "text",
         "selected",
         "selected-bg",
         "match",
         "marker",
         "muted",
+        "error",
+        "here",
         "query",
         "tab-active",
         "tab-active-bg",
@@ -76,6 +85,8 @@ impl Theme {
             "match" => &mut self.matched,
             "marker" => &mut self.marker,
             "muted" => &mut self.muted,
+            "error" => &mut self.error,
+            "here" => &mut self.here,
             "query" => &mut self.query,
             "tab-active" => &mut self.tab_active,
             "tab-active-bg" => &mut self.tab_active_bg,

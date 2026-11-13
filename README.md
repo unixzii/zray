@@ -81,6 +81,16 @@ longer exist and the one you are in are left out.
 is run, so nothing is added to your history and the edit buffer is untouched.
 <kbd>Right</kbd> puts the path, quoted, in the edit buffer instead.
 
+### What the list shows
+
+Each command shows how long ago it last ran on the right, with up to two
+marks in fixed columns before that:
+
+| Mark | Meaning |
+| --- | --- |
+| `✗` | The last run failed (a non-zero exit, other than 130 from <kbd>Ctrl-C</kbd>) |
+| `⌂` | It has been run in the current directory |
+
 ## Configuration
 
 Set these in `~/.zshrc` before the `eval` line.
@@ -114,11 +124,13 @@ export ZRAY_THEME='match=#ffb454,marker=#59c2ff,selected-bg=#1f2430,muted=244'
 | Token | Used for | Default |
 | --- | --- | --- |
 | `text` | Commands in the list | `default` |
-| `selected` | The selected command (always bold) | `default` |
+| `selected` | The selected command and its age (always bold) | `default` |
 | `selected-bg` | Background of the selected row | `default` |
 | `match` | Characters the query matched | `yellow` |
 | `marker` | The bar marking the selected row | `cyan` |
-| `muted` | Ages and the `…` of a cut-off command | `bright-black` |
+| `muted` | Ages of the other commands, the selected command's last run, and the `…` of a cut-off command | `bright-black` |
+| `error` | The `✗` mark, and a non-zero exit code in the last run | `red` |
+| `here` | The `⌂` mark | `blue` |
 | `query` | The text you type | `default` |
 | `tab-active` | The name of the tab being shown (always bold) | `bright-white` |
 | `tab-active-bg` | The block behind the name of the tab being shown | `black` |
