@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use zray::matcher::Engine;
 use zray::ranker::{DefaultRanker, RankContext};
 use zray::store::{Store, now_ms};
-use zray::theme::{self, THEME_ENV, Theme};
+use zray::tui::theme::{self, THEME_ENV, Theme};
 use zray::tui::{self, Outcome, Sources};
 
 const ZSH_INIT: &str = include_str!("../shell/zray.zsh");
@@ -98,10 +98,23 @@ enum Shell {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Init { shell: Shell::Zsh } => init_zsh(),
-        Command::Search { query, cursor, cwd, prompt, max_items, result_fd } => {
-            search(query, cursor, cwd, prompt, max_items, result_fd)
-        }
-        Command::Record { action: Record::Start { cwd, session, host, text } } => {
+        Command::Search {
+            query,
+            cursor,
+            cwd,
+            prompt,
+            max_items,
+            result_fd,
+        } => search(query, cursor, cwd, prompt, max_items, result_fd),
+        Command::Record {
+            action:
+                Record::Start {
+                    cwd,
+                    session,
+                    host,
+                    text,
+                },
+        } => {
             let id = Store::open_default()?.record_start(
                 &text,
                 cwd.as_deref(),
@@ -111,12 +124,12 @@ fn main() -> Result<()> {
             println!("{id}");
             Ok(())
         }
-        Command::Record { action: Record::Dir { path } } => {
-            Store::open_default()?.record_directory(&path)
-        }
-        Command::Record { action: Record::End { id, exit } } => {
-            Store::open_default()?.record_end(id, exit)
-        }
+        Command::Record {
+            action: Record::Dir { path },
+        } => Store::open_default()?.record_directory(&path),
+        Command::Record {
+            action: Record::End { id, exit },
+        } => Store::open_default()?.record_end(id, exit),
         Command::Theme => show_theme(),
         Command::Import { file } => import(file),
     }
@@ -124,7 +137,9 @@ fn main() -> Result<()> {
 
 fn init_zsh() -> Result<()> {
     let exe = std::env::current_exe().context("locating the zray binary")?;
-    let exe = exe.to_str().context("zray binary path is not valid UTF-8")?;
+    let exe = exe
+        .to_str()
+        .context("zray binary path is not valid UTF-8")?;
     // Single-quote for zsh.
     let quoted = format!("'{}'", exe.replace('\'', r"'\''"));
     print!("{}", ZSH_INIT.replace("__ZRAY_BIN__", &quoted));
@@ -140,7 +155,9 @@ fn search(
     result_fd: Option<RawFd>,
 ) -> Result<()> {
     let cwd = cwd.or_else(|| {
-        std::env::current_dir().ok().and_then(|p| p.to_str().map(str::to_string))
+        std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
     });
     let store = Store::open_default()?;
     let ctx = RankContext { now_ms: now_ms() };
@@ -162,8 +179,17 @@ fn search(
     // would land in the middle of the prompt. `zray theme` reports them.
     let (theme, _) = Theme::from_env();
     let outcome = tui::run(
-        Sources { commands, directories },
-        tui::Options { query, cursor, prompt, max_items, theme },
+        Sources {
+            commands,
+            directories,
+        },
+        tui::Options {
+            query,
+            cursor,
+            prompt,
+            max_items,
+            theme,
+        },
     )?;
 
     // First line is the action, the rest is the command text.
@@ -182,7 +208,8 @@ fn search(
             // SAFETY: the caller passed this descriptor for us to write the
             // result to and close; nothing else in this process uses it.
             let mut file = unsafe { File::from_raw_fd(fd) };
-            file.write_all(result.as_bytes()).context("writing result")?;
+            file.write_all(result.as_bytes())
+                .context("writing result")?;
         }
         None => print!("{result}"),
     }
@@ -199,7 +226,10 @@ fn show_theme() -> Result<()> {
         let sgr = theme::sgr(color, token.ends_with("-bg"));
         let sample = format!("\x1b[{sgr}m  sample  \x1b[0m");
         let name = theme::color_name(color);
-        println!("{token:<12} {sample} {name}{}", if changed { "  (set)" } else { "" });
+        println!(
+            "{token:<12} {sample} {name}{}",
+            if changed { "  (set)" } else { "" }
+        );
     }
     if !problems.is_empty() {
         eprintln!("\nproblems in ${THEME_ENV}:");
@@ -230,6 +260,10 @@ fn import(file: Option<PathBuf>) -> Result<()> {
         .map_or_else(now_ms, |d| d.as_millis() as i64);
     let entries = zray::history::parse(&raw, mtime_ms);
     let added = Store::open_default()?.import(&entries)?;
-    println!("imported {added} of {} entries from {}", entries.len(), path.display());
+    println!(
+        "imported {added} of {} entries from {}",
+        entries.len(),
+        path.display()
+    );
     Ok(())
 }

@@ -84,11 +84,9 @@ impl Store {
 
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
-        let conn =
-            Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         Self::init(conn)
     }
 
@@ -108,10 +106,9 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<()> {
-        let version: usize = self
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?
-            as usize;
+        let version: usize =
+            self.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
         if version >= MIGRATIONS.len() {
             return Ok(());
         }
@@ -200,8 +197,7 @@ impl Store {
         let tx = self.conn.transaction()?;
         let mut added = 0;
         {
-            let mut insert_cmd =
-                tx.prepare("INSERT OR IGNORE INTO commands (text) VALUES (?1)")?;
+            let mut insert_cmd = tx.prepare("INSERT OR IGNORE INTO commands (text) VALUES (?1)")?;
             let mut select_cmd = tx.prepare("SELECT id FROM commands WHERE text = ?1")?;
             let mut exists = tx.prepare(
                 "SELECT 1 FROM executions
@@ -219,7 +215,10 @@ impl Store {
                 insert_cmd.execute(params![e.text])?;
                 let command_id: i64 = select_cmd.query_row(params![e.text], |r| r.get(0))?;
                 let seen = exists
-                    .query_row(params![command_id, e.started_at, IMPORT_SESSION], |_| Ok(()))
+                    .query_row(
+                        params![command_id, e.started_at, IMPORT_SESSION],
+                        |_| Ok(()),
+                    )
                     .optional()?
                     .is_some();
                 if seen {
@@ -291,11 +290,16 @@ mod tests {
     #[test]
     fn record_dedups_and_tracks_stats() {
         let mut s = Store::open_in_memory().unwrap();
-        let a = s.record_start("git status", Some("/repo"), Some("s1"), None).unwrap();
+        let a = s
+            .record_start("git status", Some("/repo"), Some("s1"), None)
+            .unwrap();
         s.record_end(a, 0).unwrap();
-        let b = s.record_start("git status", Some("/other"), Some("s1"), None).unwrap();
+        let b = s
+            .record_start("git status", Some("/other"), Some("s1"), None)
+            .unwrap();
         s.record_end(b, 1).unwrap();
-        s.record_start("ls", Some("/repo"), Some("s1"), None).unwrap();
+        s.record_start("ls", Some("/repo"), Some("s1"), None)
+            .unwrap();
 
         let rows = s.load_commands(Some("/repo"), 10).unwrap();
         assert_eq!(rows.len(), 2);
@@ -342,7 +346,10 @@ mod tests {
         let s = Store::init(conn).unwrap();
         let dirs = s.load_directories(10).unwrap();
         assert_eq!(dirs.len(), 2);
-        assert_eq!((dirs[0].text.as_str(), dirs[0].count, dirs[0].last_used_at), ("/repo", 2, 300));
+        assert_eq!(
+            (dirs[0].text.as_str(), dirs[0].count, dirs[0].last_used_at),
+            ("/repo", 2, 300)
+        );
         assert_eq!((dirs[1].text.as_str(), dirs[1].count), ("/tmp", 1));
     }
 
@@ -350,9 +357,21 @@ mod tests {
     fn import_is_idempotent() {
         let mut s = Store::open_in_memory().unwrap();
         let entries = vec![
-            Entry { text: "make".into(), started_at: 1000, duration_ms: Some(5) },
-            Entry { text: "make".into(), started_at: 2000, duration_ms: None },
-            Entry { text: "ls".into(), started_at: 3000, duration_ms: None },
+            Entry {
+                text: "make".into(),
+                started_at: 1000,
+                duration_ms: Some(5),
+            },
+            Entry {
+                text: "make".into(),
+                started_at: 2000,
+                duration_ms: None,
+            },
+            Entry {
+                text: "ls".into(),
+                started_at: 3000,
+                duration_ms: None,
+            },
         ];
         assert_eq!(s.import(&entries).unwrap(), 3);
         assert_eq!(s.import(&entries).unwrap(), 0);

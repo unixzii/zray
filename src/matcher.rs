@@ -3,8 +3,8 @@
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 
-use crate::ranker::{RankContext, Ranker};
 use crate::item::Item;
+use crate::ranker::{RankContext, Ranker};
 
 struct Candidate {
     row: Item,
@@ -45,9 +45,17 @@ impl Engine {
     ) -> Self {
         let candidates = rows
             .into_iter()
-            .map(|row| Candidate { haystack: Utf32String::from(row.text.as_str()), row })
+            .map(|row| Candidate {
+                haystack: Utf32String::from(row.text.as_str()),
+                row,
+            })
             .collect();
-        Engine { candidates, matcher: Matcher::new(config), ranker, ctx }
+        Engine {
+            candidates,
+            matcher: Matcher::new(config),
+            ranker,
+            ctx,
+        }
     }
 
     /// The time the search started; ages are shown relative to it.
@@ -75,7 +83,10 @@ impl Engine {
                     None => continue,
                 },
             };
-            hits.push(Hit { index, score: self.ranker.score(&c.row, fuzzy, &self.ctx) });
+            hits.push(Hit {
+                index,
+                score: self.ranker.score(&c.row, fuzzy, &self.ctx),
+            });
         }
         // Candidates are loaded newest first, so the stable sort leaves equal
         // scores in recency order.
@@ -116,11 +127,18 @@ mod tests {
                 cwd_count: 0,
             })
             .collect();
-        Engine::new(rows, Box::new(DefaultRanker), RankContext { now_ms: n * 1000 })
+        Engine::new(
+            rows,
+            Box::new(DefaultRanker),
+            RankContext { now_ms: n * 1000 },
+        )
     }
 
     fn texts(e: &mut Engine, query: &str) -> Vec<String> {
-        e.search(query).iter().map(|h| e.row(h.index).text.clone()).collect()
+        e.search(query)
+            .iter()
+            .map(|h| e.row(h.index).text.clone())
+            .collect()
     }
 
     #[test]

@@ -74,7 +74,11 @@ pub fn parse(raw: &[u8], fallback_end_ms: i64) -> Vec<Entry> {
                 Some((start, elapsed)) => (start * 1000, Some(elapsed * 1000)),
                 None => (fallback_end_ms - (total - i as i64) * 1000, None),
             };
-            Some(Entry { text: text.to_string(), started_at, duration_ms })
+            Some(Entry {
+                text: text.to_string(),
+                started_at,
+                duration_ms,
+            })
         })
         .collect()
 }
@@ -83,7 +87,11 @@ fn parse_extended(line: &str) -> Option<(i64, i64, &str)> {
     let rest = line.strip_prefix(": ")?;
     let (meta, text) = rest.split_once(';')?;
     let (start, elapsed) = meta.split_once(':')?;
-    Some((start.trim().parse().ok()?, elapsed.trim().parse().ok()?, text))
+    Some((
+        start.trim().parse().ok()?,
+        elapsed.trim().parse().ok()?,
+        text,
+    ))
 }
 
 #[cfg(test)]

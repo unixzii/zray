@@ -7,6 +7,4 @@ pub mod item;
 pub mod matcher;
 pub mod ranker;
 pub mod store;
-pub mod term;
-pub mod theme;
 pub mod tui;

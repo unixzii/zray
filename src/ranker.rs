@@ -64,12 +64,20 @@ mod tests {
     use super::*;
 
     fn row(count: u32, last_used_at: i64, last_exit: Option<i32>, cwd_count: u32) -> Item {
-        Item { text: String::new(), count, last_used_at, last_exit, cwd_count }
+        Item {
+            text: String::new(),
+            count,
+            last_used_at,
+            last_exit,
+            cwd_count,
+        }
     }
 
     #[test]
     fn empty_query_is_pure_recency() {
-        let ctx = RankContext { now_ms: 10 * DAY_MS };
+        let ctx = RankContext {
+            now_ms: 10 * DAY_MS,
+        };
         let old_popular = row(500, DAY_MS, Some(0), 9);
         let new_rare = row(1, 2 * DAY_MS, Some(1), 0);
         assert!(
@@ -80,10 +88,15 @@ mod tests {
 
     #[test]
     fn bonuses_break_ties() {
-        let ctx = RankContext { now_ms: 100 * DAY_MS };
+        let ctx = RankContext {
+            now_ms: 100 * DAY_MS,
+        };
         let base = row(1, 0, Some(0), 0);
         let s = |r: &Item| DefaultRanker.score(r, Some(100), &ctx);
-        assert!(s(&row(1, 100 * DAY_MS, Some(0), 0)) > s(&base), "recent wins");
+        assert!(
+            s(&row(1, 100 * DAY_MS, Some(0), 0)) > s(&base),
+            "recent wins"
+        );
         assert!(s(&row(50, 0, Some(0), 0)) > s(&base), "frequent wins");
         assert!(s(&row(1, 0, Some(0), 3)) > s(&base), "same cwd wins");
         assert!(s(&row(1, 0, Some(1), 0)) < s(&base), "failed loses");

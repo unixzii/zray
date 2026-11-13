@@ -105,12 +105,19 @@ impl TermColors {
 pub fn mix(from: Rgb, to: Rgb, t: f32) -> Rgb {
     let t = t.clamp(0.0, 1.0);
     let channel = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    (channel(from.0, to.0), channel(from.1, to.1), channel(from.2, to.2))
+    (
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+    )
 }
 
 /// Whether the terminal can show arbitrary RGB colors, which a fade needs.
 pub fn supports_rgb() -> bool {
-    matches!(std::env::var("COLORTERM").as_deref(), Ok("truecolor" | "24bit"))
+    matches!(
+        std::env::var("COLORTERM").as_deref(),
+        Ok("truecolor" | "24bit")
+    )
 }
 
 /// Asks for the cursor position and, if `with_colors`, the terminal's
@@ -184,7 +191,11 @@ fn wait_for_stdin(timeout: Duration) -> io::Result<bool> {
         match ready {
             -1 => {
                 let err = io::Error::last_os_error();
-                if err.kind() == io::ErrorKind::Interrupted { Ok(false) } else { Err(err) }
+                if err.kind() == io::ErrorKind::Interrupted {
+                    Ok(false)
+                } else {
+                    Err(err)
+                }
             }
             n => Ok(n > 0),
         }
@@ -206,9 +217,12 @@ fn parse_replies(bytes: &[u8]) -> Option<Probe> {
         let rest = &bytes[i..];
         if cursor.is_none() && rest.starts_with(b"\x1b]") {
             // OSC reply: ends with BEL or ESC \.
-            let end = rest.iter().position(|&b| b == 0x07).map(|p| (p, 1)).into_iter().chain(
-                rest.windows(2).position(|w| w == b"\x1b\\").map(|p| (p, 2)),
-            );
+            let end = rest
+                .iter()
+                .position(|&b| b == 0x07)
+                .map(|p| (p, 1))
+                .into_iter()
+                .chain(rest.windows(2).position(|w| w == b"\x1b\\").map(|p| (p, 2)));
             let Some((end, terminator)) = end.min() else {
                 return None; // Not all here yet.
             };
@@ -232,7 +246,10 @@ fn parse_replies(bytes: &[u8]) -> Option<Probe> {
             // Cursor position report: ESC [ row ; col R. Anything else that
             // starts this way is a key, such as an arrow.
             let body = &rest[2..];
-            let len = body.iter().take_while(|b| b.is_ascii_digit() || **b == b';').count();
+            let len = body
+                .iter()
+                .take_while(|b| b.is_ascii_digit() || **b == b';')
+                .count();
             match body.get(len) {
                 None => return None, // Not all here yet.
                 Some(b'R') => {
@@ -254,12 +271,18 @@ fn parse_replies(bytes: &[u8]) -> Option<Probe> {
     }
 
     let colors = match (foreground, background) {
-        (Some(foreground), Some(background)) => {
-            Some(TermColors { foreground, background, palette })
-        }
+        (Some(foreground), Some(background)) => Some(TermColors {
+            foreground,
+            background,
+            palette,
+        }),
         _ => None,
     };
-    Some(Probe { cursor: cursor?, colors, typed })
+    Some(Probe {
+        cursor: cursor?,
+        colors,
+        typed,
+    })
 }
 
 /// Parses X11 color syntax as terminals report it: `rgb:RRRR/GGGG/BBBB`,
@@ -323,8 +346,7 @@ mod tests {
     #[test]
     fn keys_typed_meanwhile_are_kept_in_order() {
         // "l", Up, then after the report "s" and Enter.
-        let probe =
-            parse_replies(b"l\x1b]11;rgb:00/00/00\x07\x1b[A\x1b[3;9Rs\r").unwrap();
+        let probe = parse_replies(b"l\x1b]11;rgb:00/00/00\x07\x1b[A\x1b[3;9Rs\r").unwrap();
         assert_eq!(probe.cursor, (8, 2));
         assert_eq!(probe.typed, b"l\x1b[As\r");
     }
@@ -333,14 +355,33 @@ mod tests {
     fn resolves_colors() {
         let mut palette = [None; 16];
         palette[3] = Some((1, 2, 3));
-        let colors = TermColors { foreground: (200, 200, 200), background: (10, 10, 10), palette };
-        assert_eq!(colors.resolve(Color::Reset, colors.foreground), (200, 200, 200));
+        let colors = TermColors {
+            foreground: (200, 200, 200),
+            background: (10, 10, 10),
+            palette,
+        };
+        assert_eq!(
+            colors.resolve(Color::Reset, colors.foreground),
+            (200, 200, 200)
+        );
         assert_eq!(colors.resolve(Color::Yellow, colors.foreground), (1, 2, 3));
         assert_eq!(colors.resolve(Color::Cyan, colors.foreground), XTERM_16[6]);
-        assert_eq!(colors.resolve(Color::Indexed(3), colors.foreground), (1, 2, 3));
-        assert_eq!(colors.resolve(Color::Indexed(196), colors.foreground), (255, 0, 0));
-        assert_eq!(colors.resolve(Color::Indexed(244), colors.foreground), (128, 128, 128));
-        assert_eq!(colors.resolve(Color::Rgb(9, 8, 7), colors.foreground), (9, 8, 7));
+        assert_eq!(
+            colors.resolve(Color::Indexed(3), colors.foreground),
+            (1, 2, 3)
+        );
+        assert_eq!(
+            colors.resolve(Color::Indexed(196), colors.foreground),
+            (255, 0, 0)
+        );
+        assert_eq!(
+            colors.resolve(Color::Indexed(244), colors.foreground),
+            (128, 128, 128)
+        );
+        assert_eq!(
+            colors.resolve(Color::Rgb(9, 8, 7), colors.foreground),
+            (9, 8, 7)
+        );
     }
 
     #[test]
